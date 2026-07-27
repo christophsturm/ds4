@@ -391,6 +391,8 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float top_p, float min_p, uint64_t *rng,
                            float *prob_scratch);
 uint64_t ds4_test_mixed_native_count(void);
+#endif
+#if defined(DS4_TEST_HOOKS) || defined(CDS4_LOCK_TEST_HOOKS)
 bool ds4_test_instance_lock_claim(void);
 bool ds4_test_instance_lock_is_held(void);
 void ds4_test_instance_lock_release(void);

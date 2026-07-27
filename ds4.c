@@ -51151,7 +51151,7 @@ static void ds4_acquire_instance_lock(int *lock_fd) {
     *lock_fd = fd;
 }
 
-#ifdef DS4_TEST_HOOKS
+#if defined(DS4_TEST_HOOKS) || defined(CDS4_LOCK_TEST_HOOKS)
 static int g_ds4_test_lock_fd = -1;
 
 bool ds4_test_instance_lock_claim(void) {
