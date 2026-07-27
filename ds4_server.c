@@ -4959,11 +4959,24 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     char *body = s;
     if (!strncmp(body, "<think>", 7)) body += 7;
 
-    char *think_end = strstr(body, "</think>");
+    /* Tool scanning already treats the last close as authoritative.  Match
+     * that boundary here: Laguna can emit earlier close candidates while it
+     * is still reasoning, and those protocol bytes are not user content. */
+    char *think_end = (char *)find_last_substr(body, "</think>");
     if (think_end) {
-        *think_end = '\0';
-        *reasoning_out = xstrdup(body);
         *content_out = xstrdup(think_end + 8);
+        char *read = body;
+        char *write = body;
+        while (read < think_end) {
+            if ((size_t)(think_end - read) >= 8 &&
+                !memcmp(read, "</think>", 8)) {
+                read += 8;
+                continue;
+            }
+            *write++ = *read++;
+        }
+        *write = '\0';
+        *reasoning_out = xstrdup(body);
     } else {
         *reasoning_out = NULL;
         *content_out = xstrdup(s);
@@ -6682,8 +6695,17 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
     return ok;
 }
 
-static bool request_uses_openai_live_stream(const request *r) {
+static bool request_uses_openai_structured_stream(const request *r) {
     return r->stream && r->api == API_OPENAI && r->kind == REQ_CHAT;
+}
+
+static bool request_uses_openai_live_stream(const request *r) {
+    if (!request_uses_openai_structured_stream(r)) return false;
+    /* A Laguna close is only authoritative once generation finishes.  Keep
+     * the SSE response structured, but defer its irreversible reasoning/text
+     * projection to the final parser when thinking is enabled. */
+    return !(r->model_syntax == SERVER_MODEL_SYNTAX_LAGUNA &&
+             ds4_think_mode_enabled(r->think_mode));
 }
 
 static bool request_uses_responses_live_stream(const request *r) {
@@ -6693,7 +6715,13 @@ static bool request_uses_responses_live_stream(const request *r) {
 static bool request_uses_structured_stream(const request *r) {
     return r->stream && (r->api == API_ANTHROPIC ||
                          r->api == API_RESPONSES ||
-                         request_uses_openai_live_stream(r));
+                         request_uses_openai_structured_stream(r));
+}
+
+static bool request_can_retry_uncommitted_tool_call(const request *r) {
+    if (!r->stream) return true;
+    return request_uses_openai_structured_stream(r) &&
+           !request_uses_openai_live_stream(r);
 }
 
 /* Codex' Responses API uses 24-hex suffixes for response/item ids. Prefix
@@ -11916,7 +11944,8 @@ decode_again:
             tool_calls_free(&test_calls);
         }
         if (!completed_truncation) {
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (request_can_retry_uncommitted_tool_call(&j->req) &&
+                !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
@@ -11999,7 +12028,8 @@ decode_again:
              * Semantic repair is intentionally avoided: if the parser cannot
              * execute the block, feed the model a tool error and the protocol
              * reminder so it owns the corrected next action. */
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (request_can_retry_uncommitted_tool_call(&j->req) &&
+                !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 const char *detail = err[0] ? err : "invalid tool call";
@@ -14272,6 +14302,38 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_laguna_repeated_thinking_close_uses_authoritative_final_stream(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_LAGUNA;
+    r.think_mode = DS4_THINK_HIGH;
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *raw =
+        "first phase</think>\nsecond phase</think>Final answer.";
+
+    TEST_ASSERT(request_uses_structured_stream(&r));
+    TEST_ASSERT(!request_uses_openai_live_stream(&r));
+    TEST_ASSERT(request_can_retry_uncommitted_tool_call(&r));
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_LAGUNA, raw, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "first phase\nsecond phase"));
+    TEST_ASSERT(content && !strcmp(content, "Final answer."));
+    TEST_ASSERT(strstr(reasoning, "</think>") == NULL);
+    TEST_ASSERT(strstr(content, "</think>") == NULL);
+    TEST_ASSERT(calls.len == 0);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
 }
 
 static void test_openai_tool_stream_sends_partial_arguments(void) {
@@ -17834,6 +17896,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
+    test_laguna_repeated_thinking_close_uses_authoritative_final_stream();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
