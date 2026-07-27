@@ -1652,9 +1652,15 @@ extractor self-test run first:
 
 ```sh
 make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
+DS4_TEST_MODEL=/path/to/laguna.gguf make test-laguna
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
+
+`make test` includes the official DeepSeek API and local golden vectors.
+`make test-laguna` runs the common native tests plus Laguna's long-context,
+tool-call, thinking-recovery, kernel, and backend-equivalence checks without
+applying those DeepSeek-only vector fixtures.
 
 The batching tests are model-backed and must run on the matching GPU backend:
 

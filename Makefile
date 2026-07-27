@@ -21,6 +21,7 @@ DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support.gguf
+DS4_TEST_ARGS ?=
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -47,7 +48,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-laguna test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -57,6 +58,7 @@ help:
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
+	@echo "  make test-laguna  Build and run the Laguna-compatible test suite"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
@@ -371,7 +373,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
-	./ds4_test
+	./ds4_test $(DS4_TEST_ARGS)
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_engine_checked_open
@@ -380,6 +382,11 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 ifneq ($(UNAME_S),Darwin)
 	./tests/test_sampling
 endif
+
+test-laguna: DS4_TEST_ARGS = --laguna-attention-numeric --long-context \
+	--tool-call-quality --think-tool-recovery --metal-kernels \
+	--metal-tensor-equivalence --server
+test-laguna: test
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \

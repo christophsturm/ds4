@@ -7327,7 +7327,7 @@ static const char *test_think_recovery_request_json(void) {
         "}";
 }
 
-/* The model sometimes opens a DSML stanza without closing </think> first.
+/* The model sometimes opens a tool-call stanza without closing </think> first.
  * The server's forward recovery must force the close plus a fresh stanza
  * opening, after which the model must still complete a valid call.  The
  * malformed prefix is teacher-forced so the regression is deterministic and
@@ -7380,8 +7380,12 @@ static void test_think_tool_recovery(void) {
     if (!thinking.inside) buf_append(&forced, "<think>", 7);
     const char *body =
         "The user wants a directory listing. I will call the "
-        "list_files tool right away.\n\n" DS4_TOOL_CALLS_START;
+        "list_files tool right away.\n\n";
     buf_append(&forced, body, strlen(body));
+    const char *tool_start =
+        r.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK ?
+            DS4_TOOL_CALLS_START : "<tool_call>";
+    buf_append(&forced, tool_start, strlen(tool_start));
 
     server srv;
     memset(&srv, 0, sizeof(srv));
@@ -7462,8 +7466,8 @@ static void test_think_tool_recovery(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    bool parsed = parse_generated_message_ex(text.ptr, true,
-                                             &content, &reasoning, &calls);
+    bool parsed = parse_generated_message_ex_for_syntax(
+        r.model_syntax, text.ptr, true, &content, &reasoning, &calls);
     TEST_ASSERT(parsed);
     TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
     TEST_ASSERT(reasoning && strstr(reasoning, "list_files tool right away"));
@@ -7522,8 +7526,9 @@ static void test_tool_call_quality_one(bool quality) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    bool parsed = parse_generated_message_ex(text.ptr ? text.ptr : "",
-                                             false, &content, &reasoning, &calls);
+    bool parsed = parse_generated_message_ex_for_syntax(
+        r.model_syntax, text.ptr ? text.ptr : "", false,
+        &content, &reasoning, &calls);
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(parsed);
     TEST_ASSERT(calls.len > 0);
@@ -7808,7 +7813,7 @@ static const ds4_test_entry test_entries[] = {
      test_cuda_laguna_moe_decode_prefill},
 #endif
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
-    {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
+    {"--tool-call-quality", "tool-call-quality", "model emits valid native tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "forced </think> recovery when a tool call starts inside thinking", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
