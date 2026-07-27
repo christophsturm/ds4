@@ -200,6 +200,13 @@ typedef struct {
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 
+/* Opens an engine and reports initialization failures without terminating an
+ * embedding process. */
+int ds4_engine_open_checked(ds4_engine **out,
+                            const ds4_engine_options *opt,
+                            char *err,
+                            size_t errlen);
+
 /* Multi-GPU pipeline-parallel entry point (wave 2).
  *
  * Accepts an optional ds4_gpu_config (defined in ds4_gpu_mgpu.h) that
@@ -384,6 +391,9 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float top_p, float min_p, uint64_t *rng,
                            float *prob_scratch);
 uint64_t ds4_test_mixed_native_count(void);
+bool ds4_test_instance_lock_claim(void);
+bool ds4_test_instance_lock_is_held(void);
+void ds4_test_instance_lock_release(void);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
