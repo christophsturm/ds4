@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -819,8 +820,6 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
            il % 4u != 3u;
 }
 
-static int g_ds4_lock_fd = -1;
-
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
 #else
@@ -1142,9 +1141,42 @@ typedef struct {
     char error[256];
 } ds4_cursor;
 
+typedef struct ds4_failure_scope {
+    jmp_buf jump;
+    char *error;
+    size_t error_length;
+    struct ds4_failure_scope *previous;
+} ds4_failure_scope;
+
+static _Thread_local ds4_failure_scope *g_ds4_failure_scope;
+
+static void ds4_failure_set(const char *fmt, ...) {
+    ds4_failure_scope *scope = g_ds4_failure_scope;
+    if (!scope || !scope->error || scope->error_length == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(scope->error, scope->error_length, fmt, ap);
+    va_end(ap);
+}
+
+static _Noreturn void ds4_terminate(int status) {
+    ds4_failure_scope *scope = g_ds4_failure_scope;
+    if (scope) {
+        if (scope->error && scope->error_length != 0 &&
+            scope->error[0] == '\0') {
+            snprintf(scope->error,
+                     scope->error_length,
+                     "ds4 engine initialization failed");
+        }
+        longjmp(scope->jump, status != 0 ? status : 1);
+    }
+    exit(status);
+}
+
 static void ds4_die(const char *msg) {
     fprintf(stderr, "ds4: %s\n", msg);
-    exit(1);
+    ds4_failure_set("%s", msg);
+    ds4_terminate(1);
 }
 
 /* Attention compression is read from GGUF metadata after validating that it
@@ -1172,8 +1204,10 @@ static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
 }
 
 static void ds4_die_errno(const char *what, const char *path) {
-    fprintf(stderr, "ds4: %s '%s': %s\n", what, path, strerror(errno));
-    exit(1);
+    const int saved_errno = errno;
+    fprintf(stderr, "ds4: %s '%s': %s\n", what, path, strerror(saved_errno));
+    ds4_failure_set("%s '%s': %s", what, path, strerror(saved_errno));
+    ds4_terminate(1);
 }
 
 static bool ds4_streq(ds4_str s, const char *z) {
@@ -1231,7 +1265,7 @@ static void ds4_alloc_guard_check(const char *op, size_t size) {
             g_alloc_guard_phase ? g_alloc_guard_phase : "guarded phase",
             op,
             size);
-    exit(1);
+    ds4_terminate(1);
 }
 
 static void *xcalloc(size_t n, size_t size) {
@@ -2536,6 +2570,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) ds4_die_errno("cannot open model", path);
+    m->fd = fd;
 
     struct stat st;
     if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
@@ -2557,7 +2592,6 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
 
-    m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
 
@@ -4370,7 +4404,7 @@ static uint32_t required_u32(const ds4_model *m, const char *key) {
     uint32_t v = 0;
     if (!model_get_u32(m, key, &v)) {
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_terminate(1);
     }
     return v;
 }
@@ -4379,7 +4413,7 @@ static uint64_t required_u64_compat(const ds4_model *m, const char *key) {
     uint64_t v = 0;
     if (!model_get_u64_compat(m, key, &v)) {
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_terminate(1);
     }
     return v;
 }
@@ -4388,7 +4422,7 @@ static float required_f32(const ds4_model *m, const char *key) {
     float v = 0.0f;
     if (!model_get_f32_compat(m, key, &v)) {
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_terminate(1);
     }
     return v;
 }
@@ -4397,7 +4431,7 @@ static bool required_bool(const ds4_model *m, const char *key) {
     bool v = false;
     if (!model_get_bool(m, key, &v)) {
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_terminate(1);
     }
     return v;
 }
@@ -4406,7 +4440,7 @@ static ds4_tensor *required_tensor(const ds4_model *m, const char *name) {
     ds4_tensor *t = model_find_tensor(m, name);
     if (!t) {
         fprintf(stderr, "ds4: required tensor is missing: %s\n", name);
-        exit(1);
+        ds4_terminate(1);
     }
     return t;
 }
@@ -4450,7 +4484,7 @@ static void tensor_expect_layout(
                 t->name.ptr,
                 tensor_type_name(t->type),
                 tensor_type_name(type));
-        exit(1);
+        ds4_terminate(1);
     }
     if (t->ndim != ndim) {
         fprintf(stderr,
@@ -4459,7 +4493,7 @@ static void tensor_expect_layout(
                 t->name.ptr,
                 t->ndim,
                 ndim);
-        exit(1);
+        ds4_terminate(1);
     }
 
     const uint64_t want[3] = { d0, d1, d2 };
@@ -4472,7 +4506,7 @@ static void tensor_expect_layout(
                 i,
                 t->dim[i],
                 want[i]);
-        exit(1);
+        ds4_terminate(1);
     }
 }
 
@@ -4502,7 +4536,7 @@ static void tensor_expect_glm_dense_quant_layout(
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
-        exit(1);
+        ds4_terminate(1);
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -4520,7 +4554,7 @@ static void tensor_expect_dense_quant_layout(
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
-        exit(1);
+        ds4_terminate(1);
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -4548,7 +4582,7 @@ static void tensor_expect_plain_layout(
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
-        exit(1);
+        ds4_terminate(1);
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -4570,7 +4604,7 @@ static void tensor_expect_f16_or_q8_0_layout(
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
-        exit(1);
+        ds4_terminate(1);
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
@@ -4902,7 +4936,7 @@ static void tensor_expect_routed_expert(
                 t->name.ptr,
                 t->type,
                 tensor_type_name(t->type));
-        exit(1);
+        ds4_terminate(1);
     }
     if (t->ndim != ndim) {
         fprintf(stderr,
@@ -4911,7 +4945,7 @@ static void tensor_expect_routed_expert(
                 t->name.ptr,
                 t->ndim,
                 ndim);
-        exit(1);
+        ds4_terminate(1);
     }
 
     const uint64_t want[3] = { d0, d1, d2 };
@@ -4924,7 +4958,7 @@ static void tensor_expect_routed_expert(
                 i,
                 t->dim[i],
                 want[i]);
-        exit(1);
+        ds4_terminate(1);
     }
 }
 
@@ -5133,7 +5167,7 @@ static void weights_validate_glm_dsa_layout(
         const ds4_layer_weights *l = &w->layer[il];
         if (!weights_glm_dsa_layer_has_required(l, il)) {
             fprintf(stderr, "ds4: required GLM tensors for layer %u are missing\n", il);
-            exit(1);
+            ds4_terminate(1);
         }
 
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
@@ -5233,7 +5267,7 @@ static void weights_validate_glm_dsa_layout(
             tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
             if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
                 fprintf(stderr, "ds4: GLM routed gate/up experts use different quant types in layer %u\n", il);
-                exit(1);
+                ds4_terminate(1);
             }
             tensor_expect_glm_dense_quant_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
             tensor_expect_glm_dense_quant_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
@@ -5298,7 +5332,7 @@ static void weights_validate_layout(
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (!weights_layer_has_required(l, il)) {
             fprintf(stderr, "ds4: required tensors for layer %u are missing\n", il);
-            exit(1);
+            ds4_terminate(1);
         }
 
         tensor_expect_layout(l->hc_attn_fn,     DS4_TENSOR_F16,  2, hc_dim, hc_mix_dim, 0);
@@ -5344,7 +5378,7 @@ static void weights_validate_layout(
         tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
-            exit(1);
+            ds4_terminate(1);
         }
         tensor_expect_dense_quant_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_dense_quant_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
@@ -5765,7 +5799,7 @@ static void ds4_select_shape_from_metadata(
             n_expert,
             n_ff_exp,
             n_indexer_top_k);
-    exit(1);
+    ds4_terminate(1);
 }
 
 static void validate_compress_ratio_metadata(const ds4_model *m) {
@@ -5774,7 +5808,7 @@ static void validate_compress_ratio_metadata(const ds4_model *m) {
     if (!model_get_array(m, key, &arr) ||
         (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
         fprintf(stderr, "ds4: required int32/uint32 array metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_terminate(1);
     }
     if (arr.len < DS4_N_LAYER) {
         ds4_die("deepseek4.attention.compress_ratios is shorter than the layer count");
@@ -5798,7 +5832,7 @@ static void validate_compress_ratio_metadata(const ds4_model *m) {
             fprintf(stderr,
                     "ds4: unexpected DeepSeek4 compression ratio at layer %u for %s: got %u, expected %u\n",
                     il, DS4_MODEL_SHAPE_NAME, got, expected);
-            exit(1);
+            ds4_terminate(1);
         }
         g_ds4_compress_ratios[il] = got;
     }
@@ -5812,7 +5846,7 @@ static void validate_swiglu_clamp_metadata(const ds4_model *m) {
     if (!model_get_array(m, key, &arr) ||
         (arr.type != GGUF_VALUE_FLOAT32 && arr.type != GGUF_VALUE_FLOAT64)) {
         fprintf(stderr, "ds4: required float array metadata key is missing: %s\n", key);
-        exit(1);
+        ds4_terminate(1);
     }
     if (arr.len < DS4_N_LAYER) {
         ds4_die("deepseek4.swiglu_clamp_exp is shorter than the layer count");
@@ -5836,14 +5870,14 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
     if (got == expected) return;
     fprintf(stderr, "ds4: expected %s=%u for %s, got %u\n",
             name, expected, DS4_MODEL_SHAPE_NAME, got);
-    exit(1);
+    ds4_terminate(1);
 }
 
 static void config_expect_u64(const char *name, uint64_t got, uint64_t expected) {
     if (got == expected) return;
     fprintf(stderr, "ds4: expected %s=%" PRIu64 " for %s, got %" PRIu64 "\n",
             name, expected, DS4_MODEL_SHAPE_NAME, got);
-    exit(1);
+    ds4_terminate(1);
 }
 
 static void config_expect_f32(const char *name, float got, float expected) {
@@ -5851,7 +5885,7 @@ static void config_expect_f32(const char *name, float got, float expected) {
     if (fabsf(got - expected) <= scale * 1.0e-6f) return;
     fprintf(stderr, "ds4: expected %s=%.9g for %s, got %.9g\n",
             name, (double)expected, DS4_MODEL_SHAPE_NAME, (double)got);
-    exit(1);
+    ds4_terminate(1);
 }
 
 static void config_expect_epsilon(const char *name, float got, float expected) {
@@ -5859,14 +5893,14 @@ static void config_expect_epsilon(const char *name, float got, float expected) {
     if (fabsf(got - expected) <= tolerance) return;
     fprintf(stderr, "ds4: expected %s=%.9g for %s, got %.9g\n",
             name, (double)expected, DS4_MODEL_SHAPE_NAME, (double)got);
-    exit(1);
+    ds4_terminate(1);
 }
 
 static void config_expect_bool(const char *name, bool got, bool expected) {
     if (got == expected) return;
     fprintf(stderr, "ds4: expected %s=%s for %s, got %s\n",
             name, expected ? "true" : "false", DS4_MODEL_SHAPE_NAME, got ? "true" : "false");
-    exit(1);
+    ds4_terminate(1);
 }
 
 static void config_validate_fixed_shape(uint32_t n_layer) {
@@ -5984,7 +6018,7 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
         fprintf(stderr, "ds4: expected rope.scaling.original_context_length=%" PRIu64
                 " for %s, got %" PRIu64 "\n",
                 (uint64_t)DS4_ROPE_ORIG_CTX, DS4_MODEL_SHAPE_NAME, rope_orig_ctx);
-        exit(1);
+        ds4_terminate(1);
     }
     const float rope_freq_base = required_f32(m, "deepseek4.rope.freq_base");
     config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
@@ -6102,7 +6136,7 @@ static void config_validate_glm53_layer_types(const ds4_model *m) {
             fprintf(stderr,
                     "ds4: unexpected GLM 5.3 attention type at layer %u: got %u, expected %u\n",
                     il, got, expected);
-            exit(1);
+            ds4_terminate(1);
         }
     }
 }
@@ -6209,7 +6243,7 @@ static ds4_tensor *vision_required_tensor(
         fprintf(stderr,
                 "ds4: vision tensor %s has type %s/rank %u, expected BF16/rank %u\n",
                 name, tensor_type_name(t->type), t->ndim, ndim);
-        exit(1);
+        ds4_terminate(1);
     }
     for (uint32_t d = 0; d < ndim; d++) {
         if (t->dim[d] == dims[d]) continue;
@@ -6217,7 +6251,7 @@ static ds4_tensor *vision_required_tensor(
                 "ds4: vision tensor %s has dim[%u]=%" PRIu64
                 ", expected %" PRIu64 "\n",
                 name, d, t->dim[d], dims[d]);
-        exit(1);
+        ds4_terminate(1);
     }
     return t;
 }
@@ -6242,7 +6276,7 @@ static void vision_weights_bind(
         fprintf(stderr,
                 "ds4: vision GGUF has %" PRIu64 " tensors, expected 347\n",
                 m->n_tensors);
-        exit(1);
+        ds4_terminate(1);
     }
     config_expect_u32("vision block_count",
                       required_u32(m, "glm5-next-vision.block_count"), 24u);
@@ -6341,7 +6375,7 @@ static ds4_tensor *deepseek4_vision_required_tensor(
                 "expected %s/rank %u\n",
                 name, tensor_type_name(t->type), t->ndim,
                 tensor_type_name(type), ndim);
-        exit(1);
+        ds4_terminate(1);
     }
     for (uint32_t d = 0; d < ndim; d++) {
         if (t->dim[d] == dims[d]) continue;
@@ -6349,7 +6383,7 @@ static ds4_tensor *deepseek4_vision_required_tensor(
                 "ds4: DeepSeek vision tensor %s has dim[%u]=%" PRIu64
                 ", expected %" PRIu64 "\n",
                 name, d, t->dim[d], dims[d]);
-        exit(1);
+        ds4_terminate(1);
     }
     return t;
 }
@@ -6384,7 +6418,7 @@ static void deepseek4_vision_weights_bind(
         fprintf(stderr,
                 "ds4: DeepSeek vision GGUF has %" PRIu64
                 " tensors, expected 316\n", m->n_tensors);
-        exit(1);
+        ds4_terminate(1);
     }
     config_expect_u32("DeepSeek vision block_count",
                       required_u32(m, "deepseek4-vision.block_count"), 32u);
@@ -38775,6 +38809,7 @@ typedef enum {
 } ds4_vision_kind;
 
 struct ds4_engine {
+    int instance_lock_fd; /* -1 until this engine owns process-wide state. */
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
@@ -39649,7 +39684,7 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     int token = -1;
     if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
         fprintf(stderr, "ds4: required tokenizer token is missing: %s\n", text);
-        exit(1);
+        ds4_terminate(1);
     }
     return token;
 }
@@ -54303,23 +54338,23 @@ ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
     return mode;
 }
 
-static void ds4_release_instance_lock(void) {
-    if (g_ds4_lock_fd >= 0) {
-        close(g_ds4_lock_fd);
-        g_ds4_lock_fd = -1;
+static void ds4_release_instance_lock(int *lock_fd) {
+    if (*lock_fd >= 0) {
+        close(*lock_fd);
+        *lock_fd = -1;
     }
 }
 
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
-static void ds4_acquire_instance_lock(void) {
+static void ds4_acquire_instance_lock(int *lock_fd) {
     const char *path = getenv("DS4_LOCK_FILE");
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd < 0) {
         fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
-        exit(2);
+        ds4_terminate(2);
     }
     (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
 
@@ -54339,22 +54374,39 @@ static void ds4_acquire_instance_lock(void) {
                 fprintf(stderr, "ds4: another ds4 process is already running; refusing to start\n");
             }
             close(fd);
-            exit(2);
+            ds4_terminate(2);
         }
         fprintf(stderr, "ds4: failed to lock %s: %s\n", path, strerror(errno));
         close(fd);
-        exit(2);
+        ds4_terminate(2);
     }
 
     if (ftruncate(fd, 0) != 0) {
         fprintf(stderr, "ds4: failed to truncate lock file %s: %s\n", path, strerror(errno));
         close(fd);
-        exit(2);
+        ds4_terminate(2);
     }
     dprintf(fd, "%ld\n", (long)getpid());
-    g_ds4_lock_fd = fd;
-    atexit(ds4_release_instance_lock);
+    *lock_fd = fd;
 }
+
+#if defined(DS4_TEST_HOOKS) || defined(CDS4_LOCK_TEST_HOOKS)
+static int g_ds4_test_lock_fd = -1;
+
+bool ds4_test_instance_lock_claim(void) {
+    if (g_ds4_test_lock_fd >= 0) return false;
+    ds4_acquire_instance_lock(&g_ds4_test_lock_fd);
+    return g_ds4_test_lock_fd >= 0;
+}
+
+bool ds4_test_instance_lock_is_held(void) {
+    return g_ds4_test_lock_fd >= 0;
+}
+
+void ds4_test_instance_lock_release(void) {
+    ds4_release_instance_lock(&g_ds4_test_lock_fd);
+}
+#endif
 
 #ifndef DS4_NO_GPU
 typedef struct {
@@ -63026,6 +63078,35 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
 }
 
+int ds4_engine_open_checked(ds4_engine **out,
+                            const ds4_engine_options *opt,
+                            char *err,
+                            size_t errlen) {
+    if (!out || !opt) return 1;
+    *out = NULL;
+    if (err && errlen != 0) err[0] = '\0';
+
+    ds4_failure_scope scope = {
+        .error = err,
+        .error_length = errlen,
+        .previous = g_ds4_failure_scope,
+    };
+    g_ds4_failure_scope = &scope;
+    const int failure_status = setjmp(scope.jump);
+    if (failure_status != 0) {
+        g_ds4_failure_scope = scope.previous;
+        if (*out) {
+            ds4_engine_close(*out);
+            *out = NULL;
+        }
+        return failure_status;
+    }
+
+    const int result = ds4_engine_open_internal(out, opt, NULL);
+    g_ds4_failure_scope = scope.previous;
+    return result;
+}
+
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
@@ -63036,6 +63117,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
+    *out = e;
+    e->instance_lock_fd = -1;
 #if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     g_glm_rocm_guard_available_baseline = 0;
     (void)ds4_linux_nonmovable_memory(&g_glm_rocm_guard_available_baseline);
@@ -63128,11 +63211,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
-    if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
-    ds4_acquire_instance_lock();
+    ds4_acquire_instance_lock(&e->instance_lock_fd);
+#ifdef DS4_ROCM_BUILD
+    g_glm_rocm_guard_available_baseline = 0;
+    (void)ds4_linux_nonmovable_memory(&g_glm_rocm_guard_available_baseline);
+#endif
+    if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
 
     if (opt->simulate_used_memory_bytes != 0 &&
         !ds4_ssd_memory_lock_acquire(&e->simulated_memory,
@@ -64847,6 +64934,12 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    /* A checked open can fail before acquiring shared runtime ownership. */
+    if (e->instance_lock_fd < 0) {
+        free(e->directional_steering_file);
+        free(e);
+        return;
+    }
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
@@ -64883,7 +64976,7 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
-    ds4_release_instance_lock();
+    ds4_release_instance_lock(&e->instance_lock_fd);
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);
