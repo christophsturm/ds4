@@ -331,6 +331,17 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
+/* Current Metal allocations, separated so embedded hosts can report memory
+ * without parsing the human-readable diagnostics. */
+typedef struct ds4_gpu_memory_snapshot {
+    uint64_t model_wrapper_bytes;
+    uint64_t model_view_cache_bytes;
+    uint64_t streaming_expert_cache_bytes;
+    uint64_t tensor_live_bytes;
+    uint64_t tensor_peak_bytes;
+    uint64_t scratch_bytes;
+} ds4_gpu_memory_snapshot;
+ds4_gpu_memory_snapshot ds4_gpu_memory_snapshot_current(void);
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 
