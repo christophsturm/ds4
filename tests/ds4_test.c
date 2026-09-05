@@ -1385,6 +1385,8 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
 }
 
 static void test_metal_f16_compressor_pair_state_store_exact(void) {
+    /* Exercise the numeric kernel independently of device dispatch policy. */
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COMPRESSOR_PAIR_STATE_STORE);
     test_metal_f16_compressor_pair_state_store_exact_case(
         256, 4, 8, 0, 17, false);
     test_metal_f16_compressor_pair_state_store_exact_case(
@@ -1393,6 +1395,7 @@ static void test_metal_f16_compressor_pair_state_store_exact(void) {
         1024, 4, 11, 1, 29, true);
     test_metal_f16_compressor_pair_state_store_exact_case(
         512, 128, 255, 1, 43, false);
+    ds4_gpu_test_set_flags(0);
 }
 
 static void test_metal_compressor_ape_add_exact_case(
@@ -2793,6 +2796,8 @@ static void test_metal_contiguous_f32_f16_roundtrip_exact(void) {
 
 #if defined(__APPLE__)
 static void test_metal_gathered_kv_stage_exact(void) {
+    /* Strict selection must reach the kernel on every Metal test device. */
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_GATHERED_KV_STAGE);
     const uint32_t head_dim = 512;
     const uint32_t raw_cap = 7;
     const uint32_t n_raw = 5;
@@ -2952,6 +2957,7 @@ static void test_metal_gathered_kv_stage_exact(void) {
     for (size_t i = 0; i < sizeof(envs)/sizeof(envs[0]); i++) {
         test_restore_env(envs[i], saved[i]);
     }
+    ds4_gpu_test_set_flags(0);
     fprintf(stderr,
             "ds4-test: gathered KV staging exact cases=%zu "
             "raw_bytes=%zu comp_bytes=%zu guard_bytes=%zu\n",
