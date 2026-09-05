@@ -594,6 +594,14 @@ tests/test_engine_checked_open.o: tests/test_engine_checked_open.c ds4.c ds4.h d
 tests/test_engine_checked_open: tests/test_engine_checked_open.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+ifeq ($(UNAME_S),Darwin)
+tests/test_metal_memory_snapshot.o: tests/test_metal_memory_snapshot.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_metal_memory_snapshot: tests/test_metal_memory_snapshot.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+endif
+
 ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
@@ -676,6 +684,7 @@ tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_engine_checked_open \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+	$(if $(filter Darwin,$(UNAME_S)),tests/test_metal_memory_snapshot) \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
@@ -687,6 +696,9 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
+ifeq ($(UNAME_S),Darwin)
+	./tests/test_metal_memory_snapshot
+endif
 	./tests/test_sampling
 	./tests/test_deepseek4_vision_image
 
@@ -730,6 +742,7 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
+	rm -f tests/test_metal_memory_snapshot
 	rm -f tests/test_engine_checked_open
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_quality_api

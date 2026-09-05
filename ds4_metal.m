@@ -4259,7 +4259,9 @@ static void ds4_gpu_print_task_memory_report(void) {
             ds4_gpu_gib((uint64_t)info.virtual_size));
 }
 
-void ds4_gpu_print_memory_report(const char *label) {
+static uint64_t ds4_gpu_scratch_memory_bytes(
+        uint64_t *cached_prefill_mask_bytes_out,
+        uint64_t *cached_prefill_blk_bytes_out) {
     uint64_t cached_prefill_mask_bytes = 0;
     uint64_t cached_prefill_blk_bytes = 0;
     for (uint32_t i = 0; i < DS4_GPU_PREFILL_MASK_CACHE_SLOTS; i++) {
@@ -4268,7 +4270,13 @@ void ds4_gpu_print_memory_report(const char *label) {
         if (entry->mask) cached_prefill_mask_bytes += entry->mask_bytes;
         if (entry->blk) cached_prefill_blk_bytes += entry->blk_bytes;
     }
-    const uint64_t scratch =
+    if (cached_prefill_mask_bytes_out) {
+        *cached_prefill_mask_bytes_out = cached_prefill_mask_bytes;
+    }
+    if (cached_prefill_blk_bytes_out) {
+        *cached_prefill_blk_bytes_out = cached_prefill_blk_bytes;
+    }
+    return
         (uint64_t)g_flash_attn_mask_bytes +
         (uint64_t)g_flash_attn_zero_mask_bytes +
         cached_prefill_mask_bytes +
@@ -4300,11 +4308,33 @@ void ds4_gpu_print_memory_report(const char *label) {
         (uint64_t)g_moe_q4_gate_slots_bytes +
         (uint64_t)g_moe_q4_up_slots_bytes +
         (uint64_t)g_moe_q4_down_slots_bytes;
+}
 
+ds4_gpu_memory_snapshot ds4_gpu_memory_snapshot_current(void) {
     pthread_mutex_lock(&g_tensor_mu);
     const uint64_t tensor_live_snap = g_tensor_alloc_live_bytes;
     const uint64_t tensor_peak_snap = g_tensor_alloc_peak_bytes;
     pthread_mutex_unlock(&g_tensor_mu);
+
+    return (ds4_gpu_memory_snapshot){
+        .model_wrapper_bytes = g_model_wrap_bytes,
+        .model_view_cache_bytes = g_model_buffer_cache_bytes,
+        .streaming_expert_cache_bytes = g_stream_expert_cache_bytes,
+        .tensor_live_bytes = tensor_live_snap,
+        .tensor_peak_bytes = tensor_peak_snap,
+        .scratch_bytes = ds4_gpu_scratch_memory_bytes(NULL, NULL),
+    };
+}
+
+void ds4_gpu_print_memory_report(const char *label) {
+    uint64_t cached_prefill_mask_bytes = 0;
+    uint64_t cached_prefill_blk_bytes = 0;
+    const uint64_t scratch = ds4_gpu_scratch_memory_bytes(
+        &cached_prefill_mask_bytes, &cached_prefill_blk_bytes);
+    const ds4_gpu_memory_snapshot snapshot =
+        ds4_gpu_memory_snapshot_current();
+    const uint64_t tensor_live_snap = snapshot.tensor_live_bytes;
+    const uint64_t tensor_peak_snap = snapshot.tensor_peak_bytes;
 
     uint64_t tracked_live = tensor_live_snap;
     if (tracked_live > UINT64_MAX - g_stream_expert_cache_bytes) {
