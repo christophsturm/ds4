@@ -1,1 +1,0 @@
-La cache KV (Key-Value) su disco è un meccanismo di memorizzazione che permette di

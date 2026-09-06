@@ -1,3 +1,0 @@
-The difference between mmap page residency and virtual address space size arises due to several mechanisms in memory management:
-
-1. **

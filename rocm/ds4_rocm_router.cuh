@@ -120,12 +120,12 @@ __global__ static void router_select_warp_topk_kernel(
 
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     const uint32_t active_n_expert = n_expert != 0u ? n_expert : DS4_ROCM_N_EXPERT;
-    const uint32_t active_n_expert_used =
-        n_expert_used != 0u ?
-            n_expert_used : DS4_ROCM_DEFAULT_N_EXPERT_USED;
+    const uint32_t active_n_expert_used = n_expert_used != 0u ? n_expert_used : DS4_ROCM_N_EXPERT_USED;
     const float active_scale = expert_weight_scale != 0.0f ? expert_weight_scale : DS4_ROCM_EXPERT_WEIGHT_SCALE;
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u ||
-        (active_n_expert != DS4_ROCM_N_EXPERT && active_n_expert != DS4_ROCM_MAX_N_EXPERT) ||
+        (active_n_expert != DS4_ROCM_N_EXPERT &&
+         active_n_expert != DS4_ROCM_GLM53_N_EXPERT &&
+         active_n_expert != DS4_ROCM_MAX_N_EXPERT) ||
         active_n_expert_used > DS4_ROCM_N_EXPERT_USED ||
         !(active_scale > 0.0f) ||
         !cuda_tensor_has_f32(logits, active_n_expert) ||
@@ -157,6 +157,11 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
                     (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                     bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                     active_n_expert_used, active_scale, has_bias && !hash_mode, hash_mode);
+        } else if (active_n_expert == DS4_ROCM_GLM53_N_EXPERT) {
+            router_select_warp_topk_kernel<DS4_ROCM_GLM53_N_EXPERT><<<1, block>>>(
+                    (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                    bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                    active_n_expert_used, active_scale, has_bias && !hash_mode, hash_mode);
         } else {
             router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<1, block>>>(
                     (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
@@ -169,13 +174,13 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
 }
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
     const uint32_t active_n_expert = n_expert != 0u ? n_expert : DS4_ROCM_N_EXPERT;
-    const uint32_t active_n_expert_used =
-        n_expert_used != 0u ?
-            n_expert_used : DS4_ROCM_DEFAULT_N_EXPERT_USED;
+    const uint32_t active_n_expert_used = n_expert_used != 0u ? n_expert_used : DS4_ROCM_N_EXPERT_USED;
     const float active_scale = expert_weight_scale != 0.0f ? expert_weight_scale : DS4_ROCM_EXPERT_WEIGHT_SCALE;
     if (!selected || !weights || !probs || !logits || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
-        (active_n_expert != DS4_ROCM_N_EXPERT && active_n_expert != DS4_ROCM_MAX_N_EXPERT) ||
+        (active_n_expert != DS4_ROCM_N_EXPERT &&
+         active_n_expert != DS4_ROCM_GLM53_N_EXPERT &&
+         active_n_expert != DS4_ROCM_MAX_N_EXPERT) ||
         active_n_expert_used > DS4_ROCM_N_EXPERT_USED ||
         !(active_scale > 0.0f) ||
         (hash_mode && !cuda_tensor_has_i32(tokens, n_tokens)) ||
@@ -202,6 +207,22 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     dim3 block(32, 4, 1);
     if (active_n_expert == DS4_ROCM_MAX_N_EXPERT) {
         router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
+                (int32_t *)selected->ptr,
+                (float *)weights->ptr,
+                (float *)probs->ptr,
+                bias,
+                hash,
+                (const float *)logits->ptr,
+                tokens ? (const int32_t *)tokens->ptr : NULL,
+                0,
+                hash_rows,
+                n_tokens,
+                active_n_expert_used,
+                active_scale,
+                has_bias && !hash_mode,
+                hash_mode);
+    } else if (active_n_expert == DS4_ROCM_GLM53_N_EXPERT) {
+        router_select_warp_topk_kernel<DS4_ROCM_GLM53_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (float *)probs->ptr,

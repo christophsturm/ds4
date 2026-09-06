@@ -1,3 +1,0 @@
-Ecco una checklist per revisionare la gestione della memoria in una Pull Request (PR):
-
-### **

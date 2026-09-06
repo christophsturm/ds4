@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include "ds4_rocm_memory.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,9 +13,26 @@ ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
 int g_n_gpus = 1;
 int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
 
+extern "C" int ds4_gpu_matmul_q4_K_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_rows);
+
 static int rocm_tier_valid(int tier) {
     return tier == 0 && g_n_gpus == 1;
 }
+
+/* Decode-island graph capture is CUDA-only for now; ROCm decodes eagerly. */
+extern "C" int ds4_gpu_decode_graphs_supported(void) { return 0; }
+extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
+extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
+extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
+extern "C" void ds4_gpu_decode_graphs_invalidate(void) {}
 
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus != 1) {
@@ -40,7 +58,7 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int tier,
     if (!t) return 1;
     if (!rocm_tier_valid(tier)) return 2;
     if (bytes == 0) bytes = 1;
-    if (hipMalloc(&t->ptr, (size_t)bytes) != hipSuccess) return 3;
+    if (ds4_rocm_malloc(&t->ptr, (size_t)bytes) != hipSuccess) return 3;
     t->bytes = bytes;
     t->owner = 1;
     t->device_id = 0;
@@ -207,6 +225,24 @@ extern "C" int ds4_gpu_set_decode_score_vec4(int enabled) {
     return 0;
 }
 
+extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
+                                      weight_offset, in_dim, out_dim, x,
+                                      n_rows);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, const void *model_map,
+        uint64_t model_size, uint64_t weight0_offset,
+        uint64_t weight1_offset, uint64_t in_dim, uint64_t out0_dim,
+        uint64_t out1_dim, const ds4_gpu_tensor *x, uint32_t n_rows) {
+    return ds4_gpu_matmul_q8_0_pair_tensor(
+            out0, out1, model_map, model_size, weight0_offset, weight1_offset,
+            in_dim, out0_dim, out1_dim, x, n_rows);
+}
 
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -268,6 +304,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                          weight_offset, in_dim, out_dim, x,
                                          n_tok);
+    }
+    if (weight_type == 12u) {
+        return ds4_gpu_matmul_q4_K_tensor(out, model_map, model_size,
+                                          weight_offset, in_dim, out_dim, x,
+                                          n_tok);
     }
     return 0;
 }
@@ -369,55 +410,4 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_typed_tensor(
             cache_cap, cache_f16, n_head, kv_lora_dim, qk_nope, qk_rope,
             value_dim, n_ctx_orig, freq_base, freq_scale, ext_factor,
             attn_factor, beta_fast, beta_slow);
-}
-
-extern "C" int ds4_gpu_matmul_q6_K_tensor(
-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-        const ds4_gpu_tensor *x, uint64_t n_tok) {
-    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
-    return 0;
-}
-
-extern "C" int ds4_gpu_laguna_routed_shared_moe_one_tensor(
-        ds4_gpu_tensor *routed_out, ds4_gpu_tensor *routed_mid,
-        ds4_gpu_tensor *shared_out, ds4_gpu_tensor *shared_mid,
-        const void *model_map, uint64_t model_size,
-        const ds4_gpu_laguna_moe_desc *routed,
-        const ds4_gpu_laguna_moe_desc *shared,
-        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
-        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
-        uint32_t n_total_expert, uint32_t n_expert,
-        const ds4_gpu_tensor *shared_selected,
-        const ds4_gpu_tensor *shared_weight, const ds4_gpu_tensor *x) {
-    (void)routed_out; (void)routed_mid; (void)shared_out; (void)shared_mid;
-    (void)model_map; (void)model_size; (void)routed; (void)shared;
-    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
-    (void)selected; (void)weights; (void)n_total_expert; (void)n_expert;
-    (void)shared_selected; (void)shared_weight; (void)x;
-    return 0;
-}
-
-extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
-        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
-        ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,
-        uint64_t q_weight_offset, uint64_t k_weight_offset,
-        uint64_t v_weight_offset, uint64_t gate_weight_offset,
-        uint32_t in_dim, uint32_t q_dim, uint32_t kv_dim,
-        uint32_t gate_dim, const ds4_gpu_tensor *x) {
-    (void)q; (void)k; (void)v; (void)gate; (void)model_map; (void)model_size;
-    (void)q_weight_offset; (void)k_weight_offset; (void)v_weight_offset;
-    (void)gate_weight_offset; (void)in_dim; (void)q_dim; (void)kv_dim;
-    (void)gate_dim; (void)x;
-    return 0;
-}
-
-extern "C" int ds4_gpu_laguna_attn_output_residual_f16_tensor(
-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
-        const ds4_gpu_tensor *x, const ds4_gpu_tensor *residual) {
-    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)in_dim; (void)out_dim; (void)x; (void)residual;
-    return 0;
 }

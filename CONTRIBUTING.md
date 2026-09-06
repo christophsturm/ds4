@@ -25,13 +25,6 @@ The C test runner is `ds4_test`. Running it without arguments is equivalent to
 make test
 ```
 
-The default suite includes official DeepSeek V4 Flash vectors. For Laguna,
-run the model-compatible native suite instead:
-
-```sh
-DS4_TEST_MODEL=/path/to/laguna.gguf make test-laguna
-```
-
 Useful narrower checks:
 
 ```sh
@@ -54,7 +47,7 @@ What they cover:
   `tests/long_context_story_prompt.txt`. The model must retrieve spelled-out
   person-number assignments from a long prose prompt and return `Name=number`
   lines that the test parses.
-- `--tool-call-quality`: exercises actual model behavior for native tool-call
+- `--tool-call-quality`: exercises actual model behavior for DSML tool-call
   emission in both fast and exact paths.
 - `--metal-kernels`: isolated Metal kernel numeric checks.
 

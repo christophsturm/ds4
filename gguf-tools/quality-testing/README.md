@@ -15,13 +15,18 @@ calling hosted APIs:
 
 - `data/glm52-openrouter-100`: 100 GLM 5.2 continuations collected through
   OpenRouter `z-ai/glm-5.2` with `top_logprobs=20`.
-- `data/laguna-openrouter-100`: 100 Laguna S 2.1 continuations collected
-  through OpenRouter `poolside/laguna-s-2.1`. Poolside's endpoint does not
-  expose output-token logprobs.
-- `data/flash`: 100 DeepSeek V4 Flash continuations collected from the official
-  DeepSeek API with `top_logprobs=20`.
-- `data/pro`: 100 DeepSeek V4 PRO continuations collected from the official
-  DeepSeek API with `top_logprobs=20`.
+- `data/glm53-flash-openrouter-zai-fp8-100`: 100 GLM 5.3 Flash continuations
+  from OpenRouter's pinned Z.AI FP8 endpoint. The endpoint does not expose
+  logprobs, so these are deterministic continuation fixtures.
+- `data/glm53-flash-openrouter-zai-fp8-long`: eight code-context continuations
+  from the same FP8 endpoint, with 3K-7K prompts that exercise sparse attention.
+  Use the rendered prompts below to preserve the API's reasoning prefix.
+- `data/flash`: 100 DeepSeek V4 Flash 0731 continuations collected from the
+  official DeepSeek API with `top_logprobs=20`.
+- `data/pro`: 100 DeepSeek V4 PRO preview continuations collected from the
+  official DeepSeek API with `top_logprobs=20`.
+- `data/pro-0813`: 100 DeepSeek V4 PRO 0813 continuations collected from the
+  official DeepSeek API with `top_logprobs=20`.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
 `tests/test-vectors/`.  Those vectors drive `./ds4_test --logprob-vectors` and
@@ -32,13 +37,20 @@ full vocabulary logits.
 
 ## 2. Collect Official Continuations
 
+For the tracked DeepSeek V4 Flash 0731 fixture:
+
 ```sh
 export DEEPSEEK_API_KEY=...
 python3 gguf-tools/quality-testing/collect_official.py \
+  --model deepseek-v4-flash \
+  --endpoint https://api.deepseek.com/chat/completions \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
   --out gguf-tools/quality-testing/data/flash \
   --count 100 \
-  --max-tokens 24
+  --max-tokens 24 \
+  --top-logprobs 20 \
+  --thinking disabled \
+  --reasoning-effort omit
 ```
 
 For GLM 5.2 through OpenRouter:
@@ -61,38 +73,33 @@ python3 gguf-tools/quality-testing/collect_official.py \
   --reasoning-effort none
 ```
 
-For Laguna S 2.1 through OpenRouter:
+For GLM 5.3 Flash through the pinned Z.AI FP8 endpoint:
 
 ```sh
 export OPENROUTER_API_KEY=...
 python3 gguf-tools/quality-testing/collect_official.py \
-  --model poolside/laguna-s-2.1 \
+  --model z-ai/glm-5.3-flash \
   --endpoint https://openrouter.ai/api/v1/chat/completions \
   --api-key-env OPENROUTER_API_KEY \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
-  --out gguf-tools/quality-testing/data/laguna-openrouter-100 \
+  --out gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100 \
   --count 100 \
-  --max-tokens 24 \
+  --max-tokens 128 \
   --top-logprobs 0 \
   --token-limit-field max_tokens \
+  --provider-order z-ai/fp8 \
   --thinking omit \
-  --reasoning-effort none
+  --reasoning-effort low
 ```
 
-The Laguna fixture supports local target-token NLL, first-token agreement, and
-greedy-prefix comparison. API logprob-delta and top-N agreement fields remain
-zero because the Poolside endpoint does not return logprobs. Its raw response
-files are retained for provenance but omitted from `manifest.tsv`, avoiding
-attempts to parse unavailable API logprobs during local scoring.
-
-Use one output directory per official model.  The default model is Flash, so
-`data/flash` is the recommended path for Flash continuations.  For PRO:
+Use one output directory per checkpoint. For PRO 0813 through the official
+DeepSeek API:
 
 ```sh
 python3 gguf-tools/quality-testing/collect_official.py \
   --model deepseek-v4-pro \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
-  --out gguf-tools/quality-testing/data/pro \
+  --out gguf-tools/quality-testing/data/pro-0813 \
   --count 100 \
   --max-tokens 24 \
   --top-logprobs 20
@@ -105,9 +112,6 @@ The script writes:
 - `data/<model>/responses/case_*.json`
 - `data/<model>/manifest.tsv`
 
-The response path is the optional fourth manifest column and is included only
-when `--top-logprobs` is greater than zero.
-
 The prompt list is tracked in `prompts.jsonl`.  Curated fixture directories are
 also tracked after review; ad-hoc API collection directories should stay
 untracked until they are intentionally promoted into the release QA set.
@@ -119,6 +123,12 @@ make -C gguf-tools quality-score
 ```
 
 The scorer links against the DS4 runtime and uses Metal by default.
+
+Build the optional llama.cpp control scorer with:
+
+```sh
+make -C gguf-tools quality-llama-score
+```
 
 ## 4. Score GGUF Variants
 
@@ -136,12 +146,45 @@ gguf-tools/quality-testing/score_official \
   4096
 ```
 
-Use `data/flash/manifest.tsv` for Flash GGUFs,
-`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs, and
-`data/laguna-openrouter-100/manifest.tsv` for Laguna S 2.1 GGUFs, and
-`data/pro/manifest.tsv` for PRO GGUFs. The scorer and comparator do not care
-which model produced the manifest; the manifest path selects the continuation
-set.
+Use `data/flash/manifest.tsv` for Flash GGUFs and
+`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs. Use
+`data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv` for GLM 5.3 Flash. Use
+`data/pro/manifest.tsv` for the PRO preview checkpoint and
+`data/pro-0813/manifest.tsv` for PRO 0813. The scorer and comparator do not
+care which model produced the manifest; the manifest path selects the
+continuation set.
+
+Add `--quality` to disable DS4's speed-oriented numerical shortcuts. For an
+independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest
+and the token-identical DS4 prompt renderer:
+
+```sh
+gguf-tools/quality-testing/score_llama \
+  /path/to/model.gguf \
+  gguf-tools/quality-testing/data/flash/manifest.tsv \
+  /tmp/llama.tsv \
+  4096 \
+  deepseek-ds4
+```
+
+GLM's hosted endpoint requires reasoning. A no-thinking local prompt does not
+match a reply generated after reasoning, even at temperature zero. For the long
+GLM fixtures, render the official `Reasoning Effort: Low` template and include
+the returned reasoning before scoring the answer:
+
+```sh
+python3 gguf-tools/quality-testing/render_glm_references.py \
+  gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-long
+gguf-tools/quality-testing/score_official /path/to/GLM-5.3-Flash-Q2.gguf \
+  gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-long/manifest-rendered.tsv \
+  /tmp/glm-long.tsv 8192 --rendered-prompt
+```
+
+`--rendered-prompt` reads the prompt file with its existing chat markers; it
+does not add another chat template. The renderer can also be applied to the
+older 100-case GLM 5.3 Flash fixture. Keep rendered and legacy no-thinking
+scores separate: their prefixes differ. Z.AI supplies no token logprobs, so
+judge these runs by continuation NLL and greedy agreement, not logprob parity.
 
 For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:

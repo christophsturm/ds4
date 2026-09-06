@@ -1,3 +1,0 @@
-Here are three invariants for a tokenizer's special-token table:
-
-1. **Uniqueness of Special Tokens**:  

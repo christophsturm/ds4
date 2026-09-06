@@ -1,1 +1,0 @@
-La **latenza** e il **throughput** sono due metriche fondamentali per valutare le prest

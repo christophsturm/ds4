@@ -1,3 +1,0 @@
-The main advantage of the cache is to **accelerare l'accesso ai dati**. 
-
-Completed sentence:

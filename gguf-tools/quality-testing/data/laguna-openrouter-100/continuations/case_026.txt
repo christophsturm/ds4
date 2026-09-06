@@ -1,4 +1,0 @@
-# Long-Context Prompt Chunking Test Plan
-
-## Objective
-Verify that large prompts are correctly split into manageable chunks while maintaining

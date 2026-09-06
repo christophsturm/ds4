@@ -1,1 +1,0 @@
-The tradeoffs between **top-p (nucleus) sampling** and **temperature-zero (greedy) decoding** revolve around

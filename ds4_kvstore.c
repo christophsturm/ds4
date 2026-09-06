@@ -29,7 +29,7 @@
 /* Header byte 20 carries the graph-payload ABI.  It is separate from the outer
  * file version because the KVC envelope can remain stable while the serialized
  * ds4_session internals become unsafe to restore across runtime changes. */
-#define KV_CACHE_PAYLOAD_ABI 3u
+#define KV_CACHE_PAYLOAD_ABI 2u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail
@@ -1318,32 +1318,19 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
         kc->continued_last_store_tokens = loaded;
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
-        bool consumed = false;
-        if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
-            unlink(path);
-            consumed = true;
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
-                    kv_log_name(kc),
-                    responses_protocol ? " " : "",
-                    responses_protocol ? "RESPPROTO" : "",
-                    loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-        } else {
-            ds4_kvstore_touch_file(path, hdr.hits + 1);
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
-                    kv_log_name(kc),
-                    responses_protocol ? " " : "",
-                    responses_protocol ? "RESPPROTO" : "",
-                    loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-        }
+        ds4_kvstore_touch_file(path, hdr.hits + 1);
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                kv_log_name(kc),
+                responses_protocol ? " " : "",
+                responses_protocol ? "RESPPROTO" : "",
+                loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         if (result) {
             result->tokens = loaded;
             result->text_bytes = text_bytes;
             result->quant_bits = hdr.quant_bits;
             result->ext_flags = hdr.ext_flags;
             result->load_ms = load_ms;
-            result->consumed = consumed;
             result->path = kv_xstrdup(path);
         }
     }
