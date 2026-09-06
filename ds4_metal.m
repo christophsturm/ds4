@@ -31552,6 +31552,45 @@ static int ds4_gpu_encode_mul_mv_id(
     return 1;
 }
 
+/* Keep the resident quality kernel's reduction order while binding one cached
+ * expert per dispatch. The expert base rebases its ID onto that exact view;
+ * activation rows and destination rows retain the original selected order. */
+static int ds4_gpu_encode_mul_mv_selected(
+        id<MTLCommandBuffer> cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        __unsafe_unretained id<MTLBuffer> src0[],
+        const NSUInteger src0_off[],
+        const int32_t selected_ids[],
+        id<MTLBuffer> src1, NSUInteger src1_off,
+        id<MTLBuffer> dst, NSUInteger dst_off,
+        NSUInteger threadgroup_bytes, NSUInteger nsg,
+        bool rows_per_group_is_nr0) {
+    if (!cb || !pipeline || !args || args->nei0 <= 0 || args->nei1 != 1 ||
+        args->ne11 <= 0 || !src0 || !src0_off || !selected_ids || !src1 || !dst) return 0;
+    ds4_gpu_mul_mv_id_args one = *args;
+    one.nei0 = one.nei1 = one.ne11 = one.ne1 = 1;
+    one.nbi1 = sizeof(int32_t);
+    one.nb12 = one.nb11;
+    const NSUInteger rows = (NSUInteger)one.nr0 * (rows_per_group_is_nr0 ? 1 : nsg);
+    const NSUInteger groups = ((NSUInteger)one.ne01 + rows - 1) / rows;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    if (threadgroup_bytes) [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    for (int32_t i = 0; i < args->nei0; i++) {
+        one.tp_expert_base = selected_ids[i];
+        [enc setBytes:&one length:sizeof(one) atIndex:0];
+        [enc setBuffer:src0[i] offset:src0_off[i] atIndex:1];
+        [enc setBuffer:src1 offset:src1_off + (NSUInteger)(i % args->ne11) * args->nb11 atIndex:2];
+        [enc setBuffer:dst offset:dst_off + (NSUInteger)i * args->nb1 atIndex:3];
+        [enc setBytes:&selected_ids[i] length:sizeof(selected_ids[i]) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    }
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_attn_out_low_q8_direct(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -40668,9 +40707,11 @@ int ds4_gpu_routed_moe_one_tensor(
             g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
             g_moe_mul_mv_addr_iq2_xxs_pipeline != nil &&
             getenv("DS4_METAL_DISABLE_IQ2_STREAM_ADDR_TABLE") == NULL;
+        const bool use_quality_selected_slots =
+            !force_resident && g_ssd_streaming_mode && g_quality_mode;
         const bool use_selected_slots =
             use_q4_selected_slots || use_iq2_selected_slots ||
-            use_mxfp4_selected_slots || use_iq2_stream_addr_table;
+            use_mxfp4_selected_slots || use_iq2_stream_addr_table || use_quality_selected_slots;
         id<MTLComputePipelineState> slots_pair_swiglu_pipeline =
             use_iq2_selected_slots ? g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline :
             (use_mxfp4_selected_slots ? g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline :
@@ -41016,7 +41057,7 @@ int ds4_gpu_routed_moe_one_tensor(
             use_stream_expert_cache =
                 !use_iq2_full_expert_addr_table &&
                 (use_iq2_selected_slots || use_iq2_stream_addr_table ||
-                 use_q4_selected_slots || use_mxfp4_selected_slots) &&
+                 use_q4_selected_slots || use_mxfp4_selected_slots || use_quality_selected_slots) &&
                 stream_expert_cache_size_known &&
                 ds4_gpu_stream_expert_cache_effective_cap(layer_index,
                                                           n_total_expert,
@@ -41473,6 +41514,7 @@ int ds4_gpu_routed_moe_one_tensor(
                 const uint64_t selected_cache_evictions =
                     g_stream_expert_cache_evictions - selected_cache_evictions0;
                 const char *selected_path =
+                    use_quality_selected_slots ? "quality" :
                     use_iq2_stream_addr_table ? "iq2/iq2" :
                     (use_iq2_selected_slots ? "iq2/q2" :
                     (use_mxfp4_selected_slots ? "mxfp4/mxfp4" : "q4/q4"));
@@ -41541,6 +41583,7 @@ int ds4_gpu_routed_moe_one_tensor(
                                                     layer_index);
         const char *moe_one_stage_filter = getenv("DS4_METAL_MOE_STAGE_PROFILE_FILTER");
         const char *moe_one_path =
+            use_quality_selected_slots ? "quality_selected" :
             use_q4_grouped_experts ? "q4_grouped_pair_swiglu" :
             use_q4_group6_experts ? "q4_group6_pair_swiglu" :
             use_q4_group8_experts ? "q4_group8_pair_swiglu" :
@@ -41892,6 +41935,17 @@ int ds4_gpu_routed_moe_one_tensor(
                                                   gate_smem,
                                                   2,
                                                   false);
+        } else if (use_quality_selected_slots) {
+            ok = (!use_stream_expert_cache ||
+                  ds4_gpu_stream_expert_cache_mark_entries_inflight(stream_slot_entries, n_expert, 0)) &&
+                 ds4_gpu_encode_mul_mv_selected(cb, gate_mv_pipeline, &gate_args,
+                    gate_slot_bufs, gate_slot_offsets, selected_ids,
+                    xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+                    gate_smem, gate_nsg, gate_rows_per_group_is_nr0) &&
+                 ds4_gpu_encode_mul_mv_selected(cb, gate_mv_pipeline, &gate_args,
+                    up_slot_bufs, up_slot_offsets, selected_ids,
+                    xbuf, ds4_gpu_tensor_offset(x), upbuf, ds4_gpu_tensor_offset(up),
+                    gate_smem, gate_nsg, gate_rows_per_group_is_nr0);
         } else if (use_q4_gather_slots || use_selected_slots) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
                 .width = expert_mid_dim,
@@ -42468,6 +42522,11 @@ int ds4_gpu_routed_moe_one_tensor(
                                                     ds4_gpu_tensor_offset(selected),
                                                     down_smem,
                                                     2);
+        } else if (ok && use_quality_selected_slots) {
+            ok = ds4_gpu_encode_mul_mv_selected(cb, down_mv_pipeline, &down_args,
+                down_slot_bufs, down_slot_offsets, selected_ids,
+                midbuf, ds4_gpu_tensor_offset(mid), down_dst, down_dst_off,
+                down_smem, down_nsg, down_rows_per_group_is_nr0);
         } else if (ok && (use_q4_gather_slots || use_selected_slots)) {
             if (use_stream_expert_addr_table) {
                 if (down_type == DS4_METAL_TENSOR_IQ2_XXS) {
