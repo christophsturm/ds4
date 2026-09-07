@@ -15124,124 +15124,128 @@ static void ds4_gpu_stream_expert_cache_clear_entry(
 }
 
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
-    ds4_gpu_stream_expert_pending_load_clear();
-    g_stream_expert_cache_done_seq = g_stream_expert_cache_cb_seq;
-    g_stream_expert_cache_batch_seq = 0;
-    g_stream_expert_cache_owned_seq = 0;
-    g_stream_expert_cache_pending_max_seq = 0;
-    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
-        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
-            g_stream_expert_cache[layer][expert].inflight_seq = 0;
-            ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
+    /* MTLBuffer.contents extends ownership through the current autorelease pool.
+     * C callers must not retain cache slabs until their thread exits. */
+    @autoreleasepool {
+        ds4_gpu_stream_expert_pending_load_clear();
+        g_stream_expert_cache_done_seq = g_stream_expert_cache_cb_seq;
+        g_stream_expert_cache_batch_seq = 0;
+        g_stream_expert_cache_owned_seq = 0;
+        g_stream_expert_cache_pending_max_seq = 0;
+        for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+            for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+                g_stream_expert_cache[layer][expert].inflight_seq = 0;
+                ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
+            }
+            ds4_gpu_stream_full_expert_addr_clear_layer(layer);
+            g_stream_expert_cache_layer_count[layer] = 0;
+            id<MTLBuffer> buffers[3] = {
+                g_stream_expert_cache_gate_addr_buffers[layer],
+                g_stream_expert_cache_up_addr_buffers[layer],
+                g_stream_expert_cache_down_addr_buffers[layer],
+            };
+            for (uint32_t i = 0; i < 3; i++) {
+                if (!buffers[i]) continue;
+                const NSUInteger bytes =
+                    (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
+                memset([buffers[i] contents], 0, bytes);
+            }
         }
-        ds4_gpu_stream_full_expert_addr_clear_layer(layer);
-        g_stream_expert_cache_layer_count[layer] = 0;
-        id<MTLBuffer> buffers[3] = {
-            g_stream_expert_cache_gate_addr_buffers[layer],
-            g_stream_expert_cache_up_addr_buffers[layer],
-            g_stream_expert_cache_down_addr_buffers[layer],
-        };
-        for (uint32_t i = 0; i < 3; i++) {
-            if (!buffers[i]) continue;
-            const NSUInteger bytes =
-                (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
-            memset([buffers[i] contents], 0, bytes);
+        g_stream_expert_cache_bytes = 0;
+        g_stream_expert_cache_entry_count = 0;
+        for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+            g_stream_expert_cache_slabs[i] = nil;
+            g_stream_expert_cache_slab_start_slot[i] = 0;
+            g_stream_expert_cache_slab_slot_count[i] = 0;
+            g_stream_expert_cache_slab_slots_used[i] = 0;
         }
-    }
-    g_stream_expert_cache_bytes = 0;
-    g_stream_expert_cache_entry_count = 0;
-    for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
-        g_stream_expert_cache_slabs[i] = nil;
-        g_stream_expert_cache_slab_start_slot[i] = 0;
-        g_stream_expert_cache_slab_slot_count[i] = 0;
-        g_stream_expert_cache_slab_slots_used[i] = 0;
-    }
-    g_stream_expert_cache_slab_count = 0;
-    g_stream_expert_cache_slab_total_slots = 0;
-    g_stream_expert_cache_free_slot_count = 0;
-    g_stream_expert_cache_slab_slot_bytes = 0;
-    memset(g_stream_expert_cache_slab_slot_locked,
-           0,
-           sizeof(g_stream_expert_cache_slab_slot_locked));
-    if (reset_stats) {
-        g_stream_expert_cache_hits = 0;
-        g_stream_expert_cache_misses = 0;
-        g_stream_expert_cache_evictions = 0;
-        g_stream_expert_cache_wraps = 0;
-        g_stream_expert_cache_clock = 0;
-        g_stream_expert_cache_evict_advise_bytes = 0;
-        g_stream_expert_cache_willneed_advise_bytes = 0;
-        g_stream_expert_cache_pread_bytes = 0;
-        g_stream_expert_cache_pread_ms = 0.0;
-        g_stream_expert_cache_mlock_bytes = 0;
-        g_stream_expert_cache_mlock_fail_bytes = 0;
-        g_stream_expert_cache_mlock_failures = 0;
-        g_stream_expert_cache_mlock_ms = 0.0;
-        g_stream_expert_cache_mlock_warned = 0;
-        g_stream_expert_cache_mlock_budget_cap = 0;
-        g_stream_expert_cache_mlock_relief_applied = 0;
-        g_stream_expert_cache_buffer_allocs = 0;
-        g_stream_expert_cache_buffer_reuses = 0;
-        g_stream_expert_cache_decode_tokens = 0;
-        g_stream_expert_cache_first_decode_layer = UINT32_MAX;
-        g_stream_expert_cache_hotness_decay_token = 0;
-        memset(g_stream_expert_cache_route_hotness,
+        g_stream_expert_cache_slab_count = 0;
+        g_stream_expert_cache_slab_total_slots = 0;
+        g_stream_expert_cache_free_slot_count = 0;
+        g_stream_expert_cache_slab_slot_bytes = 0;
+        memset(g_stream_expert_cache_slab_slot_locked,
                0,
-               sizeof(g_stream_expert_cache_route_hotness));
-        g_stream_expert_timing_selected_calls = 0;
-        g_stream_expert_timing_selected_read_ms = 0.0;
-        g_stream_expert_timing_selected_sync_ms = 0.0;
-        g_stream_expert_timing_selected_copy_ms = 0.0;
-        g_stream_expert_timing_selected_bind_ms = 0.0;
-        g_stream_expert_timing_split_layers = 0;
-        g_stream_expert_timing_split_resident_experts = 0;
-        g_stream_expert_timing_split_missing_experts = 0;
-        g_stream_expert_timing_split_resident_ms = 0.0;
-        g_stream_expert_timing_split_missing_ms = 0.0;
-        g_stream_expert_timing_split_missing_load_ms = 0.0;
-        g_stream_expert_timing_split_missing_slot_ms = 0.0;
-        g_stream_expert_timing_split_missing_prune_ms = 0.0;
-        g_stream_expert_timing_split_missing_addr_ms = 0.0;
-        g_stream_expert_timing_split_missing_wait_ms = 0.0;
-        g_stream_expert_timing_load_calls = 0;
-        g_stream_expert_timing_load_prepare_ms = 0.0;
-        g_stream_expert_timing_load_pread_ms = 0.0;
-        g_stream_expert_timing_load_install_ms = 0.0;
-        g_stream_expert_timing_prepare_batch_reuse_calls = 0;
-        g_stream_expert_timing_prepare_batch_reuse_ms = 0.0;
-        g_stream_expert_timing_prepare_buffer_calls = 0;
-        g_stream_expert_timing_prepare_buffer_ms = 0.0;
-        g_stream_expert_timing_prepare_task_experts = 0;
-        g_stream_expert_timing_prepare_task_ms = 0.0;
-        g_stream_expert_timing_reuse_scan_calls = 0;
-        g_stream_expert_timing_reuse_scan_entries = 0;
-        g_stream_expert_timing_reuse_scan_ms = 0.0;
-        g_stream_expert_timing_reuse_clear_ms = 0.0;
-        g_stream_expert_timing_readahead_calls = 0;
-        g_stream_expert_timing_readahead_bytes = 0;
-        g_stream_expert_timing_readahead_ms = 0.0;
-        g_stream_expert_timing_cache_all_resident_layers = 0;
-        g_stream_expert_timing_cache_all_missing_layers = 0;
-        g_stream_expert_timing_cache_mixed_layers = 0;
-        g_stream_expert_timing_cache_resident_experts = 0;
-        g_stream_expert_timing_cache_missing_experts = 0;
-        g_stream_expert_timing_last_report =
-            (ds4_gpu_stream_expert_timing_snapshot){0};
-        memset(g_stream_expert_cache_layer_hits,
-               0,
-               sizeof(g_stream_expert_cache_layer_hits));
-        memset(g_stream_expert_cache_layer_misses,
-               0,
-               sizeof(g_stream_expert_cache_layer_misses));
-        memset(g_stream_expert_cache_layer_evictions,
-               0,
-               sizeof(g_stream_expert_cache_layer_evictions));
-        memset(g_stream_expert_cache_layer_pread_bytes,
-               0,
-               sizeof(g_stream_expert_cache_layer_pread_bytes));
-        memset(g_stream_expert_cache_layer_pread_ms,
-               0,
-               sizeof(g_stream_expert_cache_layer_pread_ms));
+               sizeof(g_stream_expert_cache_slab_slot_locked));
+        if (reset_stats) {
+            g_stream_expert_cache_hits = 0;
+            g_stream_expert_cache_misses = 0;
+            g_stream_expert_cache_evictions = 0;
+            g_stream_expert_cache_wraps = 0;
+            g_stream_expert_cache_clock = 0;
+            g_stream_expert_cache_evict_advise_bytes = 0;
+            g_stream_expert_cache_willneed_advise_bytes = 0;
+            g_stream_expert_cache_pread_bytes = 0;
+            g_stream_expert_cache_pread_ms = 0.0;
+            g_stream_expert_cache_mlock_bytes = 0;
+            g_stream_expert_cache_mlock_fail_bytes = 0;
+            g_stream_expert_cache_mlock_failures = 0;
+            g_stream_expert_cache_mlock_ms = 0.0;
+            g_stream_expert_cache_mlock_warned = 0;
+            g_stream_expert_cache_mlock_budget_cap = 0;
+            g_stream_expert_cache_mlock_relief_applied = 0;
+            g_stream_expert_cache_buffer_allocs = 0;
+            g_stream_expert_cache_buffer_reuses = 0;
+            g_stream_expert_cache_decode_tokens = 0;
+            g_stream_expert_cache_first_decode_layer = UINT32_MAX;
+            g_stream_expert_cache_hotness_decay_token = 0;
+            memset(g_stream_expert_cache_route_hotness,
+                   0,
+                   sizeof(g_stream_expert_cache_route_hotness));
+            g_stream_expert_timing_selected_calls = 0;
+            g_stream_expert_timing_selected_read_ms = 0.0;
+            g_stream_expert_timing_selected_sync_ms = 0.0;
+            g_stream_expert_timing_selected_copy_ms = 0.0;
+            g_stream_expert_timing_selected_bind_ms = 0.0;
+            g_stream_expert_timing_split_layers = 0;
+            g_stream_expert_timing_split_resident_experts = 0;
+            g_stream_expert_timing_split_missing_experts = 0;
+            g_stream_expert_timing_split_resident_ms = 0.0;
+            g_stream_expert_timing_split_missing_ms = 0.0;
+            g_stream_expert_timing_split_missing_load_ms = 0.0;
+            g_stream_expert_timing_split_missing_slot_ms = 0.0;
+            g_stream_expert_timing_split_missing_prune_ms = 0.0;
+            g_stream_expert_timing_split_missing_addr_ms = 0.0;
+            g_stream_expert_timing_split_missing_wait_ms = 0.0;
+            g_stream_expert_timing_load_calls = 0;
+            g_stream_expert_timing_load_prepare_ms = 0.0;
+            g_stream_expert_timing_load_pread_ms = 0.0;
+            g_stream_expert_timing_load_install_ms = 0.0;
+            g_stream_expert_timing_prepare_batch_reuse_calls = 0;
+            g_stream_expert_timing_prepare_batch_reuse_ms = 0.0;
+            g_stream_expert_timing_prepare_buffer_calls = 0;
+            g_stream_expert_timing_prepare_buffer_ms = 0.0;
+            g_stream_expert_timing_prepare_task_experts = 0;
+            g_stream_expert_timing_prepare_task_ms = 0.0;
+            g_stream_expert_timing_reuse_scan_calls = 0;
+            g_stream_expert_timing_reuse_scan_entries = 0;
+            g_stream_expert_timing_reuse_scan_ms = 0.0;
+            g_stream_expert_timing_reuse_clear_ms = 0.0;
+            g_stream_expert_timing_readahead_calls = 0;
+            g_stream_expert_timing_readahead_bytes = 0;
+            g_stream_expert_timing_readahead_ms = 0.0;
+            g_stream_expert_timing_cache_all_resident_layers = 0;
+            g_stream_expert_timing_cache_all_missing_layers = 0;
+            g_stream_expert_timing_cache_mixed_layers = 0;
+            g_stream_expert_timing_cache_resident_experts = 0;
+            g_stream_expert_timing_cache_missing_experts = 0;
+            g_stream_expert_timing_last_report =
+                (ds4_gpu_stream_expert_timing_snapshot){0};
+            memset(g_stream_expert_cache_layer_hits,
+                   0,
+                   sizeof(g_stream_expert_cache_layer_hits));
+            memset(g_stream_expert_cache_layer_misses,
+                   0,
+                   sizeof(g_stream_expert_cache_layer_misses));
+            memset(g_stream_expert_cache_layer_evictions,
+                   0,
+                   sizeof(g_stream_expert_cache_layer_evictions));
+            memset(g_stream_expert_cache_layer_pread_bytes,
+                   0,
+                   sizeof(g_stream_expert_cache_layer_pread_bytes));
+            memset(g_stream_expert_cache_layer_pread_ms,
+                   0,
+                   sizeof(g_stream_expert_cache_layer_pread_ms));
+        }
     }
 }
 
@@ -16442,296 +16446,298 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
-    if (!g_ssd_streaming_mode ||
-        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
-        return 1;
-    }
-    if (!table) return 0;
-    const void *model_map = table->model_map;
-    const uint64_t model_size = table->model_size;
-    const uint32_t layer = table->layer;
-    const uint32_t n_total_expert = table->n_total_expert;
-    const uint64_t gate_offset = table->gate_offset;
-    const uint64_t up_offset = table->up_offset;
-    const uint64_t down_offset = table->down_offset;
-    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
-    const uint64_t down_expert_bytes = table->down_expert_bytes;
-    if (!model_map || !selected_ids ||
-        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
-        n_selected == 0 ||
-        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
-        n_total_expert == 0 ||
-        n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
-        !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
-                                                      down_expert_bytes) ||
-        ds4_gpu_stream_expert_cache_effective_cap(layer,
-                                                  n_total_expert,
-                                                  n_selected) == 0) {
-        return 1;
-    }
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-
-    if (ds4_gpu_stream_expert_pending_load_matches(model_map,
-                                                   model_size,
-                                                   layer,
-                                                   selected_ids,
-                                                   n_total_expert,
-                                                   n_selected,
-                                                   gate_expert_bytes,
-                                                   down_expert_bytes)) {
-        return 1;
-    }
-
-    ds4_gpu_stream_expert_pending_load_clear();
-    ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
-    p->active = 0;
-    p->model_map = model_map;
-    p->model_size = model_size;
-    p->layer = layer;
-    p->n_total_expert = n_total_expert;
-    p->n_selected = n_selected;
-    p->missing_mask = 0;
-    p->n_loads = 0;
-    p->n_tasks = 0;
-    p->gate_expert_bytes = gate_expert_bytes;
-    p->down_expert_bytes = down_expert_bytes;
-    p->prepare_ms = 0.0;
-    const int load_timing = ds4_gpu_stream_expert_timing_summary_enabled();
-    const double load_prepare_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
-    for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
-        p->selected_ids[i] = -1;
-        p->load_slots[i] = 0;
-        p->source_slots[i] = UINT32_MAX;
-        p->gate_abs_offsets[i] = 0;
-        p->up_abs_offsets[i] = 0;
-        p->down_abs_offsets[i] = 0;
-        p->gate_bufs[i] = nil;
-        p->up_bufs[i] = nil;
-        p->down_bufs[i] = nil;
-        p->gate_inners[i] = 0;
-        p->up_inners[i] = 0;
-        p->down_inners[i] = 0;
-    }
-    memset(p->tasks, 0, sizeof(p->tasks));
-
-    for (uint32_t i = 0; i < n_selected; i++) {
-        if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
-            fprintf(stderr,
-                    "ds4: Metal streaming early-load expert id %d is outside 0..%u\n",
-                    selected_ids[i],
-                    n_total_expert);
-            return 0;
+    @autoreleasepool {
+        if (!g_ssd_streaming_mode ||
+            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
+            return 1;
         }
-        p->selected_ids[i] = selected_ids[i];
-        const uint64_t expert_id = (uint64_t)(uint32_t)selected_ids[i];
-        if (expert_id > UINT64_MAX / gate_expert_bytes ||
-            expert_id > UINT64_MAX / down_expert_bytes) {
-            fprintf(stderr, "ds4: Metal streaming early-load offset overflow\n");
-            return 0;
+        if (!table) return 0;
+        const void *model_map = table->model_map;
+        const uint64_t model_size = table->model_size;
+        const uint32_t layer = table->layer;
+        const uint32_t n_total_expert = table->n_total_expert;
+        const uint64_t gate_offset = table->gate_offset;
+        const uint64_t up_offset = table->up_offset;
+        const uint64_t down_offset = table->down_offset;
+        const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+        const uint64_t down_expert_bytes = table->down_expert_bytes;
+        if (!model_map || !selected_ids ||
+            layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+            n_selected == 0 ||
+            n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
+            n_total_expert == 0 ||
+            n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+            !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
+                                                          down_expert_bytes) ||
+            ds4_gpu_stream_expert_cache_effective_cap(layer,
+                                                      n_total_expert,
+                                                      n_selected) == 0) {
+            return 1;
         }
-        const uint64_t gate_rel = expert_id * gate_expert_bytes;
-        const uint64_t down_rel = expert_id * down_expert_bytes;
-        if (gate_rel > UINT64_MAX - gate_offset ||
-            gate_rel > UINT64_MAX - up_offset ||
-            down_rel > UINT64_MAX - down_offset) {
-            fprintf(stderr, "ds4: Metal streaming early-load offset overflow\n");
-            return 0;
-        }
-        p->gate_abs_offsets[i] = gate_offset + gate_rel;
-        p->up_abs_offsets[i] = up_offset + gate_rel;
-        p->down_abs_offsets[i] = down_offset + down_rel;
+        if (!g_initialized && !ds4_gpu_init()) return 0;
 
-        ds4_gpu_stream_expert_cache_entry *e =
-            &g_stream_expert_cache[layer][(uint32_t)selected_ids[i]];
-        if (ds4_gpu_stream_expert_cache_entry_matches(e,
-                                                      model_map,
-                                                      model_size,
-                                                      p->gate_abs_offsets[i],
-                                                      p->up_abs_offsets[i],
-                                                      p->down_abs_offsets[i],
-                                                      gate_expert_bytes,
-                                                      down_expert_bytes)) {
-            continue;
+        if (ds4_gpu_stream_expert_pending_load_matches(model_map,
+                                                       model_size,
+                                                       layer,
+                                                       selected_ids,
+                                                       n_total_expert,
+                                                       n_selected,
+                                                       gate_expert_bytes,
+                                                       down_expert_bytes)) {
+            return 1;
         }
 
-        uint32_t source = UINT32_MAX;
-        for (uint32_t prev = 0; prev < i; prev++) {
-            if (selected_ids[prev] == selected_ids[i] &&
-                p->gate_abs_offsets[prev] == p->gate_abs_offsets[i] &&
-                p->up_abs_offsets[prev] == p->up_abs_offsets[i] &&
-                p->down_abs_offsets[prev] == p->down_abs_offsets[i] &&
-                (p->missing_mask & (1u << prev)) != 0) {
-                source = p->source_slots[prev] != UINT32_MAX ?
-                         p->source_slots[prev] : prev;
-                break;
+        ds4_gpu_stream_expert_pending_load_clear();
+        ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
+        p->active = 0;
+        p->model_map = model_map;
+        p->model_size = model_size;
+        p->layer = layer;
+        p->n_total_expert = n_total_expert;
+        p->n_selected = n_selected;
+        p->missing_mask = 0;
+        p->n_loads = 0;
+        p->n_tasks = 0;
+        p->gate_expert_bytes = gate_expert_bytes;
+        p->down_expert_bytes = down_expert_bytes;
+        p->prepare_ms = 0.0;
+        const int load_timing = ds4_gpu_stream_expert_timing_summary_enabled();
+        const double load_prepare_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+        for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
+            p->selected_ids[i] = -1;
+            p->load_slots[i] = 0;
+            p->source_slots[i] = UINT32_MAX;
+            p->gate_abs_offsets[i] = 0;
+            p->up_abs_offsets[i] = 0;
+            p->down_abs_offsets[i] = 0;
+            p->gate_bufs[i] = nil;
+            p->up_bufs[i] = nil;
+            p->down_bufs[i] = nil;
+            p->gate_inners[i] = 0;
+            p->up_inners[i] = 0;
+            p->down_inners[i] = 0;
+        }
+        memset(p->tasks, 0, sizeof(p->tasks));
+
+        for (uint32_t i = 0; i < n_selected; i++) {
+            if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
+                fprintf(stderr,
+                        "ds4: Metal streaming early-load expert id %d is outside 0..%u\n",
+                        selected_ids[i],
+                        n_total_expert);
+                return 0;
             }
-        }
-        if (source != UINT32_MAX) {
-            p->source_slots[i] = source;
+            p->selected_ids[i] = selected_ids[i];
+            const uint64_t expert_id = (uint64_t)(uint32_t)selected_ids[i];
+            if (expert_id > UINT64_MAX / gate_expert_bytes ||
+                expert_id > UINT64_MAX / down_expert_bytes) {
+                fprintf(stderr, "ds4: Metal streaming early-load offset overflow\n");
+                return 0;
+            }
+            const uint64_t gate_rel = expert_id * gate_expert_bytes;
+            const uint64_t down_rel = expert_id * down_expert_bytes;
+            if (gate_rel > UINT64_MAX - gate_offset ||
+                gate_rel > UINT64_MAX - up_offset ||
+                down_rel > UINT64_MAX - down_offset) {
+                fprintf(stderr, "ds4: Metal streaming early-load offset overflow\n");
+                return 0;
+            }
+            p->gate_abs_offsets[i] = gate_offset + gate_rel;
+            p->up_abs_offsets[i] = up_offset + gate_rel;
+            p->down_abs_offsets[i] = down_offset + down_rel;
+
+            ds4_gpu_stream_expert_cache_entry *e =
+                &g_stream_expert_cache[layer][(uint32_t)selected_ids[i]];
+            if (ds4_gpu_stream_expert_cache_entry_matches(e,
+                                                          model_map,
+                                                          model_size,
+                                                          p->gate_abs_offsets[i],
+                                                          p->up_abs_offsets[i],
+                                                          p->down_abs_offsets[i],
+                                                          gate_expert_bytes,
+                                                          down_expert_bytes)) {
+                continue;
+            }
+
+            uint32_t source = UINT32_MAX;
+            for (uint32_t prev = 0; prev < i; prev++) {
+                if (selected_ids[prev] == selected_ids[i] &&
+                    p->gate_abs_offsets[prev] == p->gate_abs_offsets[i] &&
+                    p->up_abs_offsets[prev] == p->up_abs_offsets[i] &&
+                    p->down_abs_offsets[prev] == p->down_abs_offsets[i] &&
+                    (p->missing_mask & (1u << prev)) != 0) {
+                    source = p->source_slots[prev] != UINT32_MAX ?
+                             p->source_slots[prev] : prev;
+                    break;
+                }
+            }
+            if (source != UINT32_MAX) {
+                p->source_slots[i] = source;
+                p->missing_mask |= 1u << i;
+                continue;
+            }
+            p->source_slots[i] = i;
             p->missing_mask |= 1u << i;
-            continue;
+            p->load_slots[p->n_loads++] = i;
         }
-        p->source_slots[i] = i;
-        p->missing_mask |= 1u << i;
-        p->load_slots[p->n_loads++] = i;
-    }
-    if (p->n_loads == 0) return 1;
+        if (p->n_loads == 0) return 1;
 
-    const uint32_t cache_budget =
-        ds4_gpu_stream_expert_cache_configured_budget();
-    uint32_t reserved_entries = g_stream_expert_cache_entry_count;
-    ds4_gpu_stream_expert_reusable_buffers
-        batch_reuse[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
-    for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
-        batch_reuse[i] =
-            (ds4_gpu_stream_expert_reusable_buffers){ nil, nil, nil, 0, 0, 0 };
-    }
-    uint32_t batch_reuse_count = 0;
-    if (cache_budget != 0 &&
-        reserved_entries >= cache_budget &&
-        p->n_loads > 1 &&
-        ds4_gpu_stream_expert_batch_reuse_enabled(gate_expert_bytes,
-                                                  down_expert_bytes)) {
-        const double reuse_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
-        batch_reuse_count =
-            ds4_gpu_stream_expert_cache_take_reusable_batch(
-                    p->n_loads,
-                    layer,
-                    selected_ids,
-                    n_selected,
-                    gate_expert_bytes,
-                    down_expert_bytes,
-                    batch_reuse);
-        if (load_timing) {
-            ds4_gpu_stream_expert_timing_note_prepare_batch_reuse(
-                    ds4_gpu_now_ms() - reuse_t0);
+        const uint32_t cache_budget =
+            ds4_gpu_stream_expert_cache_configured_budget();
+        uint32_t reserved_entries = g_stream_expert_cache_entry_count;
+        ds4_gpu_stream_expert_reusable_buffers
+            batch_reuse[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+        for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
+            batch_reuse[i] =
+                (ds4_gpu_stream_expert_reusable_buffers){ nil, nil, nil, 0, 0, 0 };
         }
-    }
-    for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
-        const uint32_t slot = p->load_slots[load_i];
-        const uint32_t expert = (uint32_t)p->selected_ids[slot];
-        const int force_reuse =
-            cache_budget != 0 && reserved_entries >= cache_budget;
-
-        ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot],
-                                              down_expert_bytes);
-
-        if (load_i < batch_reuse_count &&
-            batch_reuse[load_i].gate_buffer &&
-            batch_reuse[load_i].up_buffer &&
-            batch_reuse[load_i].down_buffer) {
-            p->gate_bufs[load_i] = batch_reuse[load_i].gate_buffer;
-            p->up_bufs[load_i] = batch_reuse[load_i].up_buffer;
-            p->down_bufs[load_i] = batch_reuse[load_i].down_buffer;
-            p->gate_inners[load_i] = batch_reuse[load_i].gate_inner;
-            p->up_inners[load_i] = batch_reuse[load_i].up_inner;
-            p->down_inners[load_i] = batch_reuse[load_i].down_inner;
-        } else {
-            const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
-            const int prepared =
-                ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
-                                                                 expert,
-                                                                 layer,
-                                                                 selected_ids,
-                                                                 n_selected,
-                                                                 gate_expert_bytes,
-                                                                 down_expert_bytes,
-                                                                 force_reuse,
-                                                                 &p->gate_bufs[load_i],
-                                                                 &p->up_bufs[load_i],
-                                                                 &p->down_bufs[load_i],
-                                                                 &p->gate_inners[load_i],
-                                                                 &p->up_inners[load_i],
-                                                                 &p->down_inners[load_i]);
+        uint32_t batch_reuse_count = 0;
+        if (cache_budget != 0 &&
+            reserved_entries >= cache_budget &&
+            p->n_loads > 1 &&
+            ds4_gpu_stream_expert_batch_reuse_enabled(gate_expert_bytes,
+                                                      down_expert_bytes)) {
+            const double reuse_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+            batch_reuse_count =
+                ds4_gpu_stream_expert_cache_take_reusable_batch(
+                        p->n_loads,
+                        layer,
+                        selected_ids,
+                        n_selected,
+                        gate_expert_bytes,
+                        down_expert_bytes,
+                        batch_reuse);
             if (load_timing) {
-                ds4_gpu_stream_expert_timing_note_prepare_buffer(
-                        ds4_gpu_now_ms() - buffer_t0);
+                ds4_gpu_stream_expert_timing_note_prepare_batch_reuse(
+                        ds4_gpu_now_ms() - reuse_t0);
             }
-            if (!prepared) {
+        }
+        for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
+            const uint32_t slot = p->load_slots[load_i];
+            const uint32_t expert = (uint32_t)p->selected_ids[slot];
+            const int force_reuse =
+                cache_budget != 0 && reserved_entries >= cache_budget;
+
+            ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
+                                                  gate_expert_bytes);
+            ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot],
+                                                  gate_expert_bytes);
+            ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot],
+                                                  down_expert_bytes);
+
+            if (load_i < batch_reuse_count &&
+                batch_reuse[load_i].gate_buffer &&
+                batch_reuse[load_i].up_buffer &&
+                batch_reuse[load_i].down_buffer) {
+                p->gate_bufs[load_i] = batch_reuse[load_i].gate_buffer;
+                p->up_bufs[load_i] = batch_reuse[load_i].up_buffer;
+                p->down_bufs[load_i] = batch_reuse[load_i].down_buffer;
+                p->gate_inners[load_i] = batch_reuse[load_i].gate_inner;
+                p->up_inners[load_i] = batch_reuse[load_i].up_inner;
+                p->down_inners[load_i] = batch_reuse[load_i].down_inner;
+            } else {
+                const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+                const int prepared =
+                    ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
+                                                                     expert,
+                                                                     layer,
+                                                                     selected_ids,
+                                                                     n_selected,
+                                                                     gate_expert_bytes,
+                                                                     down_expert_bytes,
+                                                                     force_reuse,
+                                                                     &p->gate_bufs[load_i],
+                                                                     &p->up_bufs[load_i],
+                                                                     &p->down_bufs[load_i],
+                                                                     &p->gate_inners[load_i],
+                                                                     &p->up_inners[load_i],
+                                                                     &p->down_inners[load_i]);
+                if (load_timing) {
+                    ds4_gpu_stream_expert_timing_note_prepare_buffer(
+                            ds4_gpu_now_ms() - buffer_t0);
+                }
+                if (!prepared) {
+                    ds4_gpu_stream_expert_pending_load_release_buffers(p);
+                    return 0;
+                }
+            }
+            if (!force_reuse && reserved_entries < UINT32_MAX) {
+                reserved_entries++;
+            }
+            uint8_t *gate_dst = (uint8_t *)[p->gate_bufs[load_i] contents] +
+                                 p->gate_inners[load_i];
+            uint8_t *up_dst = (uint8_t *)[p->up_bufs[load_i] contents] +
+                               p->up_inners[load_i];
+            uint8_t *down_dst = (uint8_t *)[p->down_bufs[load_i] contents] +
+                                 p->down_inners[load_i];
+            if (!gate_dst || !up_dst || !down_dst) {
                 ds4_gpu_stream_expert_pending_load_release_buffers(p);
                 return 0;
             }
+            const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+            p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = p->gate_abs_offsets[slot],
+                .len = gate_expert_bytes,
+                .dst = gate_dst,
+            };
+            p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = p->up_abs_offsets[slot],
+                .len = gate_expert_bytes,
+                .dst = up_dst,
+            };
+            p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+                .offset = p->down_abs_offsets[slot],
+                .len = down_expert_bytes,
+                .dst = down_dst,
+            };
+            if (load_timing) {
+                ds4_gpu_stream_expert_timing_note_prepare_task(
+                        1,
+                        ds4_gpu_now_ms() - task_t0);
+            }
         }
-        if (!force_reuse && reserved_entries < UINT32_MAX) {
-            reserved_entries++;
+
+        const uint32_t n_workers =
+            ds4_gpu_stream_expert_pread_thread_count(p->n_tasks);
+        p->start_ms = ds4_gpu_now_ms();
+        if (load_timing) {
+            p->prepare_ms = p->start_ms - load_prepare_t0;
         }
-        uint8_t *gate_dst = (uint8_t *)[p->gate_bufs[load_i] contents] +
-                             p->gate_inners[load_i];
-        uint8_t *up_dst = (uint8_t *)[p->up_bufs[load_i] contents] +
-                           p->up_inners[load_i];
-        uint8_t *down_dst = (uint8_t *)[p->down_bufs[load_i] contents] +
-                             p->down_inners[load_i];
-        if (!gate_dst || !up_dst || !down_dst) {
+        if (ds4_gpu_stream_expert_pread_pool_begin(p->tasks,
+                                                   p->n_tasks,
+                                                   n_workers)) {
+            p->active = 1;
+            if (ds4_gpu_stream_expert_pending_load_profile_enabled()) {
+                fprintf(stderr,
+                        "ds4: Metal streaming expert early-load begin layer=%u experts=%u tensors=%u threads=%u\n",
+                        layer,
+                        p->n_loads,
+                        p->n_tasks,
+                        n_workers);
+            }
+            return 1;
+        }
+
+        uint64_t read_bytes = 0;
+        double read_ms = 0.0;
+        if (!ds4_gpu_stream_expert_pread_tasks(p->tasks,
+                                               p->n_tasks,
+                                               &read_bytes,
+                                               &read_ms)) {
             ds4_gpu_stream_expert_pending_load_release_buffers(p);
             return 0;
         }
-        const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->gate_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = gate_dst,
-        };
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->up_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = up_dst,
-        };
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->down_abs_offsets[slot],
-            .len = down_expert_bytes,
-            .dst = down_dst,
-        };
-        if (load_timing) {
-            ds4_gpu_stream_expert_timing_note_prepare_task(
-                    1,
-                    ds4_gpu_now_ms() - task_t0);
+        (void)read_bytes;
+        if (!ds4_gpu_stream_expert_pending_load_install(p, NULL, read_ms)) {
+            ds4_gpu_stream_expert_pending_load_release_buffers(p);
+            return 0;
         }
-    }
-
-    const uint32_t n_workers =
-        ds4_gpu_stream_expert_pread_thread_count(p->n_tasks);
-    p->start_ms = ds4_gpu_now_ms();
-    if (load_timing) {
-        p->prepare_ms = p->start_ms - load_prepare_t0;
-    }
-    if (ds4_gpu_stream_expert_pread_pool_begin(p->tasks,
-                                               p->n_tasks,
-                                               n_workers)) {
-        p->active = 1;
-        if (ds4_gpu_stream_expert_pending_load_profile_enabled()) {
-            fprintf(stderr,
-                    "ds4: Metal streaming expert early-load begin layer=%u experts=%u tensors=%u threads=%u\n",
-                    layer,
-                    p->n_loads,
-                    p->n_tasks,
-                    n_workers);
-        }
+        ds4_gpu_stream_expert_pending_load_release_buffers(p);
+        p->n_tasks = 0;
+        p->n_loads = 0;
+        p->prepare_ms = 0.0;
         return 1;
     }
-
-    uint64_t read_bytes = 0;
-    double read_ms = 0.0;
-    if (!ds4_gpu_stream_expert_pread_tasks(p->tasks,
-                                           p->n_tasks,
-                                           &read_bytes,
-                                           &read_ms)) {
-        ds4_gpu_stream_expert_pending_load_release_buffers(p);
-        return 0;
-    }
-    (void)read_bytes;
-    if (!ds4_gpu_stream_expert_pending_load_install(p, NULL, read_ms)) {
-        ds4_gpu_stream_expert_pending_load_release_buffers(p);
-        return 0;
-    }
-    ds4_gpu_stream_expert_pending_load_release_buffers(p);
-    p->n_tasks = 0;
-    p->n_loads = 0;
-    p->prepare_ms = 0.0;
-    return 1;
 }
 
 static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
@@ -17781,81 +17787,85 @@ int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
-    if (!g_ssd_streaming_mode) return 1;
-    if (!table) return 0;
-    const void *model_map = table->model_map;
-    const uint64_t model_size = table->model_size;
-    const uint32_t layer = table->layer;
-    const uint32_t n_total_expert = table->n_total_expert;
-    const uint64_t gate_offset = table->gate_offset;
-    const uint64_t up_offset = table->up_offset;
-    const uint64_t down_offset = table->down_offset;
-    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
-    const uint64_t down_expert_bytes = table->down_expert_bytes;
-    if (!model_map || !selected_ids ||
-        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
-        n_selected == 0 ||
-        n_selected > 6 ||
-        n_total_expert == 0 ||
-        n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
-        !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
-                                                      down_expert_bytes) ||
-        ds4_gpu_stream_expert_cache_effective_cap(layer,
-                                                  n_total_expert,
-                                                  n_selected) == 0) {
+    /* MTLBuffer.contents extends ownership through the current autorelease pool.
+     * C callers must not retain cache slabs until their thread exits. */
+    @autoreleasepool {
+        if (!g_ssd_streaming_mode) return 1;
+        if (!table) return 0;
+        const void *model_map = table->model_map;
+        const uint64_t model_size = table->model_size;
+        const uint32_t layer = table->layer;
+        const uint32_t n_total_expert = table->n_total_expert;
+        const uint64_t gate_offset = table->gate_offset;
+        const uint64_t up_offset = table->up_offset;
+        const uint64_t down_offset = table->down_offset;
+        const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+        const uint64_t down_expert_bytes = table->down_expert_bytes;
+        if (!model_map || !selected_ids ||
+            layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+            n_selected == 0 ||
+            n_selected > 6 ||
+            n_total_expert == 0 ||
+            n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+            !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
+                                                          down_expert_bytes) ||
+            ds4_gpu_stream_expert_cache_effective_cap(layer,
+                                                      n_total_expert,
+                                                      n_selected) == 0) {
+            return 1;
+        }
+        if (!g_initialized && !ds4_gpu_init()) return 0;
+
+        ds4_gpu_stream_expert_cache_note_selected_hotness(layer,
+                                                          selected_ids,
+                                                          n_selected);
+        for (uint32_t i = 0; i < n_selected; i++) {
+            if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
+                fprintf(stderr,
+                        "ds4: Metal prefill expert-cache seed selected expert id %d is outside 0..%u\n",
+                        selected_ids[i],
+                        n_total_expert);
+                return 0;
+            }
+            const uint64_t expert_id = (uint64_t)(uint32_t)selected_ids[i];
+            if (expert_id > UINT64_MAX / gate_expert_bytes ||
+                expert_id > UINT64_MAX / down_expert_bytes) {
+                fprintf(stderr, "ds4: Metal prefill expert-cache seed offset overflow\n");
+                return 0;
+            }
+            const uint64_t gate_rel = expert_id * gate_expert_bytes;
+            const uint64_t down_rel = expert_id * down_expert_bytes;
+            if (gate_rel > UINT64_MAX - gate_offset ||
+                gate_rel > UINT64_MAX - up_offset ||
+                down_rel > UINT64_MAX - down_offset) {
+                fprintf(stderr, "ds4: Metal prefill expert-cache seed offset overflow\n");
+                return 0;
+            }
+
+            if (!ds4_gpu_stream_expert_cache_get(model_map,
+                                                 model_size,
+                                                 layer,
+                                                 (uint32_t)selected_ids[i],
+                                                 n_total_expert,
+                                                 n_selected,
+                                                 gate_offset + gate_rel,
+                                                 up_offset + gate_rel,
+                                                 down_offset + down_rel,
+                                                 gate_expert_bytes,
+                                                 down_expert_bytes)) {
+                return 0;
+            }
+        }
+        ds4_gpu_stream_expert_cache_prune_layer(layer,
+                                                n_total_expert,
+                                                n_selected,
+                                                selected_ids,
+                                                n_selected);
+        ds4_gpu_stream_expert_cache_prune_global(layer,
+                                                 selected_ids,
+                                                 n_selected);
         return 1;
     }
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-
-    ds4_gpu_stream_expert_cache_note_selected_hotness(layer,
-                                                      selected_ids,
-                                                      n_selected);
-    for (uint32_t i = 0; i < n_selected; i++) {
-        if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
-            fprintf(stderr,
-                    "ds4: Metal prefill expert-cache seed selected expert id %d is outside 0..%u\n",
-                    selected_ids[i],
-                    n_total_expert);
-            return 0;
-        }
-        const uint64_t expert_id = (uint64_t)(uint32_t)selected_ids[i];
-        if (expert_id > UINT64_MAX / gate_expert_bytes ||
-            expert_id > UINT64_MAX / down_expert_bytes) {
-            fprintf(stderr, "ds4: Metal prefill expert-cache seed offset overflow\n");
-            return 0;
-        }
-        const uint64_t gate_rel = expert_id * gate_expert_bytes;
-        const uint64_t down_rel = expert_id * down_expert_bytes;
-        if (gate_rel > UINT64_MAX - gate_offset ||
-            gate_rel > UINT64_MAX - up_offset ||
-            down_rel > UINT64_MAX - down_offset) {
-            fprintf(stderr, "ds4: Metal prefill expert-cache seed offset overflow\n");
-            return 0;
-        }
-
-        if (!ds4_gpu_stream_expert_cache_get(model_map,
-                                             model_size,
-                                             layer,
-                                             (uint32_t)selected_ids[i],
-                                             n_total_expert,
-                                             n_selected,
-                                             gate_offset + gate_rel,
-                                             up_offset + gate_rel,
-                                             down_offset + down_rel,
-                                             gate_expert_bytes,
-                                             down_expert_bytes)) {
-            return 0;
-        }
-    }
-    ds4_gpu_stream_expert_cache_prune_layer(layer,
-                                            n_total_expert,
-                                            n_selected,
-                                            selected_ids,
-                                            n_selected);
-    ds4_gpu_stream_expert_cache_prune_global(layer,
-                                             selected_ids,
-                                             n_selected);
-    return 1;
 }
 
 static int ds4_gpu_stream_expert_cache_seed_experts_impl(
@@ -18003,11 +18013,13 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts) {
-    return ds4_gpu_stream_expert_cache_seed_experts_impl(table,
-                                                         expert_ids,
-                                                         expert_priorities,
-                                                         n_experts,
-                                                         0);
+    @autoreleasepool {
+        return ds4_gpu_stream_expert_cache_seed_experts_impl(table,
+                                                             expert_ids,
+                                                             expert_priorities,
+                                                             n_experts,
+                                                             0);
+    }
 }
 
 int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
@@ -18015,11 +18027,13 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts) {
-    return ds4_gpu_stream_expert_cache_seed_experts_impl(table,
-                                                         expert_ids,
-                                                         expert_priorities,
-                                                         n_experts,
-                                                         1);
+    @autoreleasepool {
+        return ds4_gpu_stream_expert_cache_seed_experts_impl(table,
+                                                             expert_ids,
+                                                             expert_priorities,
+                                                             n_experts,
+                                                             1);
+    }
 }
 static uint32_t ds4_gpu_q4_expert_table_group_size(uint32_t n_total_expert) {
     const char *env = getenv("DS4_METAL_Q4_EXPERT_TABLE_GROUP_SIZE");
