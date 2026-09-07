@@ -79,7 +79,10 @@ static int check_case(const void *model, uint64_t model_size,
             INPUT, MID, OUTPUT, it, wt, EXPERTS, SELECTED, 7.0f,
             xt, 0, tokens, &half_mid, true);
         ok = ok && half_mid == (tokens >= 32);
-        for (int i = 0; i < 5 && ok; i++) {
+        /* Gate/up are scratch: fused SwiGLU kernels write mid directly and do
+         * not bind those two destinations. Verify the observable intermediate,
+         * expert projection and reduced output on both fused and unfused paths. */
+        for (int i = 2; i < 5 && ok; i++) {
             /* Tiny kernels leave unowned intermediates untouched; the fused
              * down reduction also omits the optional expert output tensor. */
             if (tokens <= 4 && i == 3) continue;
