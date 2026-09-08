@@ -47546,6 +47546,26 @@ static bool glm_graph_mtp_matmul(
                                                false) != 0;
 }
 
+/* Keeps the draft block's input, layer, and shared head available together
+ * after streaming target decode has narrowed the model's mapped window. */
+static bool glm_graph_stream_map_mtp(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+    if (!g || !model || !weights || il >= DS4_N_LAYER) return false;
+    if (!g->ssd_streaming || g->streaming_static_decode_map_current) return true;
+
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_decode_runtime_slice_spans(
+                weights, il, il, true, true, &spans)) {
+        return false;
+    }
+    const bool ok = metal_graph_install_model_spans(model, &spans, "GLM MTP");
+    free(spans.v);
+    return ok;
+}
+
 /* One MTP step at (absolute) position pos: consumes the main model's last
  * hidden h[pos] (g->cur for GLM-5.2, g->hc_cur for GLM-5.3) and next_token
  * (= token[pos+1]), writes the nextn KV at slot pos, and returns the
@@ -47573,6 +47593,7 @@ static bool glm_graph_mtp_step(
         fprintf(stderr, "ds4: glm mtp: nextn weights missing at layer %u\n", il);
         return false;
     }
+    if (!glm_graph_stream_map_mtp(g, model, weights, il)) return false;
     const uint32_t kv_raw_dim = (uint32_t)l->attn_kv_a_mqa->dim[1];
     const float rope_base = layer_rope_freq_base(il);
     const float rope_scale = layer_rope_freq_scale(il);
