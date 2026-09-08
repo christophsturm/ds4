@@ -736,7 +736,7 @@ test-frontends: ds4_test ds4_agent_test
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_engine_checked_open \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	$(if $(filter Darwin,$(UNAME_S)),tests/test_metal_memory_snapshot tests/test_metal_quality_streaming tests/test_metal_streaming_lifetime) \
+	$(if $(filter Darwin,$(UNAME_S)),tests/test_metal_memory_snapshot tests/test_metal_quality_streaming tests/test_metal_streaming_lifetime tests/test_session_state_gpu) \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
@@ -752,6 +752,7 @@ ifeq ($(UNAME_S),Darwin)
 	./tests/test_metal_memory_snapshot
 	./tests/test_metal_quality_streaming
 	./tests/test_metal_streaming_lifetime
+	./tests/test_session_state_gpu
 endif
 	./tests/test_sampling
 	./tests/test_deepseek4_vision_image

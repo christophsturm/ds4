@@ -230,6 +230,98 @@ static void test_text_observations(void) {
 }
 
 #ifndef DS4_NO_GPU
+/* Reproduce the MTP window transition with real Metal reads and tiny weights.
+ * No model download, machine memory budget, or environment switch is needed. */
+static void test_glm_streaming_mtp_weights(void) {
+    enum { DIM = 32, STRIDE = 16384, WEIGHTS = 11, BYTES = STRIDE * WEIGHTS };
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM53;
+    g_ds4_shape.n_layer = 2;
+    g_ds4_shape.n_nextn_predict = 1;
+    void *bytes = mmap(NULL, BYTES, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON, -1, 0);
+    assert(bytes != MAP_FAILED);
+    ds4_tensor tensors[WEIGHTS] = {0};
+    for (int i = 0; i < WEIGHTS; i++) {
+        tensors[i].ndim = 1;
+        tensors[i].dim[0] = DIM;
+        tensors[i].elements = DIM;
+        tensors[i].type = DS4_TENSOR_F32;
+        tensors[i].abs_offset = (uint64_t)i * STRIDE;
+        tensors[i].bytes = DIM * sizeof(float);
+        float *values = (float *)((uint8_t *)bytes + tensors[i].abs_offset);
+        for (int d = 0; d < DIM; d++) values[d] = (float)(i + 1);
+    }
+    /* The mapping policy inspects routed storage types. Give those tensors a
+     * valid quantized layout; the GPU probe reads only their sentinel prefix. */
+    for (int i = 5; i <= 7; i++) {
+        tensors[i].type = DS4_TENSOR_Q2_K;
+        tensors[i].ndim = 3;
+        tensors[i].dim[0] = 256;
+        tensors[i].dim[1] = 4;
+        tensors[i].dim[2] = 1;
+        tensors[i].elements = 1024;
+        tensors[i].bytes = 4 * 84;
+    }
+    ds4_model model = {.map = bytes, .size = BYTES};
+    ds4_weights *weights = calloc(1, sizeof(*weights));
+    ds4_glm_gpu_graph *g = calloc(1, sizeof(*g));
+    assert(weights && g);
+    weights->token_embd = &tensors[0];
+    weights->layer[1].nextn_enorm = &tensors[1];
+    weights->layer[1].nextn_hnorm = &tensors[2];
+    weights->layer[1].nextn_eh_proj = &tensors[3];
+    weights->layer[1].nextn_shared_head_norm = &tensors[4];
+    weights->layer[1].ffn_gate_exps = &tensors[5];
+    weights->layer[1].ffn_up_exps = &tensors[6];
+    weights->layer[1].ffn_down_exps = &tensors[7];
+    weights->output_norm = &tensors[8];
+    weights->output = &tensors[9];
+    weights->layer[0].attn_norm = &tensors[10];
+    /* Resident and cached global maps must retain an unrelated target weight.
+     * Restricted output and target-layer windows must expose every MTP input. */
+    for (int mode = 0; mode < 4; mode++) {
+        assert(ds4_gpu_init());
+        ds4_gpu_set_ssd_streaming(mode != 0);
+        g->ssd_streaming = mode != 0;
+        g->streaming_static_decode_map_current = mode == 1;
+        /* Streaming starts with just embeddings, as engine_open does. A full
+         * initial map would already cover all later spans and hide this bug. */
+        const bool initial_map = mode < 2 ? ds4_gpu_set_model_map(bytes, BYTES) :
+            glm_graph_stream_map_token(g, &model, weights);
+        assert(initial_map);
+        ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(DIM * sizeof(float));
+        ds4_gpu_tensor *output = ds4_gpu_tensor_alloc(DIM * sizeof(float));
+        assert(input && output);
+        assert(ds4_gpu_tensor_fill_f32(input, 1, DIM));
+        bool window_ready = true;
+        if (mode == 2) window_ready = glm_graph_stream_map_output(g, &model, weights);
+        if (mode == 3) window_ready = glm_graph_stream_map_decode_layer(g, &model, weights, 0);
+        assert(window_ready);
+        assert(glm_graph_stream_map_mtp(g, &model, weights, 1));
+        assert(g->streaming_static_decode_map_current == (mode == 1));
+        const int count = mode < 2 ? WEIGHTS : WEIGHTS - 1;
+        for (int i = 0; i < count; i++) {
+            const int encoded = ds4_gpu_rms_norm_weight_tensor(
+                    output, input, bytes, BYTES, tensors[i].abs_offset, DIM, 1e-6f);
+            fprintf(stderr, "MTP weight window mode=%d tensor=%d encoded=%d\n", mode, i, encoded);
+            assert(encoded);
+            float actual[DIM] = {0};
+            assert(ds4_gpu_tensor_read(output, 0, actual, sizeof(actual)));
+            const float expected = (float)(i + 1) / sqrtf(1.0f + 1e-6f);
+            for (int d = 0; d < DIM; d++) assert(fabsf(actual[d] - expected) < 1e-5f);
+        }
+        ds4_gpu_tensor_free(input);
+        ds4_gpu_tensor_free(output);
+        ds4_gpu_set_ssd_streaming(false);
+        ds4_gpu_cleanup();
+    }
+    free(g);
+    free(weights);
+    munmap(bytes, BYTES);
+    g_ds4_shape = saved_shape;
+}
+
 static void test_glm_attention_budget(void) {
     const ds4_shape saved_shape = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_GLM53;
@@ -348,6 +440,7 @@ int main(void) {
     test_snapshot_bytes();
     test_text_observations();
 #ifndef DS4_NO_GPU
+    test_glm_streaming_mtp_weights();
     test_glm_attention_budget();
     test_glm_spec_rollback();
 #endif
