@@ -142,7 +142,34 @@ static void test_model_validation_does_not_terminate_host(void) {
           "model validation returns through the checked-open failure boundary");
 }
 
+/* V4.1 array metadata is validated during checked engine loading. */
+static void test_array_validation_does_not_terminate_host(void) {
+    fprintf(stderr, "RUN: V4.1 array validation does not terminate host\n");
+    const pid_t child = fork();
+    if (child == 0) {
+        char error[256] = {0};
+        ds4_failure_scope scope = {.error = error, .error_length = sizeof(error)};
+        g_ds4_failure_scope = &scope;
+        const int result = setjmp(scope.jump);
+        if (result == 0) {
+            ds4_model model = {0};
+            const uint32_t expected[] = {1};
+            config_expect_u32_array(&model, "deepseek41.engram.layers", expected, 1);
+            _exit(2);
+        }
+        g_ds4_failure_scope = NULL;
+        _exit(result == 1 && error[0] != '\0' ? 0 : 3);
+    }
+    int status = 0;
+    const pid_t waited = child > 0 ? waitpid(child, &status, 0) : -1;
+    CHECK(child > 0, "fork array-validation child");
+    CHECK(waited == child, "wait for array-validation child");
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "V4.1 validation returns through the checked-open failure boundary");
+}
+
 int main(void) {
+    test_array_validation_does_not_terminate_host();
     test_invalid_model_does_not_terminate_host();
     test_failed_open_preserves_existing_lock();
     test_model_validation_does_not_terminate_host();
