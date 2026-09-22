@@ -7181,6 +7181,7 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
+    bool thinking_started;
     bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
@@ -8012,7 +8013,13 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                                      bool final) {
     if (!st->active || !raw) return true;
 
+    /* A completed block can be followed by another block in the same chunk. */
+next_block:
     if (st->mode == OPENAI_STREAM_THINKING) {
+        if (!st->thinking_started) {
+            if (!sse_chat_delta_n(fd, r, id, "reasoning_block", "started", 7)) return false;
+            st->thinking_started = true;
+        }
         if (!st->checked_think_prefix) {
             const char *open = "<think>";
             const size_t open_len = strlen(open);
@@ -8062,6 +8069,8 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         if (close) {
+            if (!sse_chat_delta_n(fd, r, id, "reasoning_block", "completed", 9)) return false;
+            st->thinking_started = false;
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
             st->mode = OPENAI_STREAM_TEXT;
         } else if (final) {
@@ -8079,11 +8088,13 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                 find_any_tool_start(raw + st->emit_pos) : NULL;
             if (close && (!tool || close < tool)) {
                 const size_t limit = (size_t)(close - raw);
+                if (!sse_chat_delta_n(fd, r, id, "reasoning_block", "started", 7)) return false;
                 if (limit > st->emit_pos &&
                     !sse_chat_delta_n(fd, r, id, "reasoning_content",
                                       raw + st->emit_pos,
                                       limit - st->emit_pos)) return false;
                 if (limit > st->emit_pos) st->sent_reasoning = true;
+                if (!sse_chat_delta_n(fd, r, id, "reasoning_block", "completed", 9)) return false;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
             } else if (!tool && !final) {
@@ -8097,6 +8108,18 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
 
+        const char *open = strstr(raw + st->emit_pos, "<think>");
+        if (open && (!tool || open < tool)) {
+            if ((size_t)(open - raw) < limit) limit = (size_t)(open - raw);
+        } else {
+            open = NULL;
+            if (!final) {
+                for (size_t n = 1; n < strlen("<think>") && n <= raw_len - st->emit_pos; n++) {
+                    if (!strncmp(raw + raw_len - n, "<think>", n) && raw_len - n < limit)
+                        limit = raw_len - n;
+                }
+            }
+        }
         if (limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "content",
                                   raw + st->emit_pos,
@@ -8105,6 +8128,13 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             st->emit_pos = limit;
         }
 
+        if (open) {
+            st->emit_pos = (size_t)(open - raw) + strlen("<think>");
+            st->checked_think_prefix = true;
+            st->guard_second_reasoning = false;
+            st->mode = OPENAI_STREAM_THINKING;
+            goto next_block;
+        }
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
             if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
@@ -16837,6 +16867,63 @@ static void test_responses_usage_reports_cache_details(void) {
     request_free(&r);
 }
 
+/* Boundaries are observable independently of content, and text bytes are never
+ * inferred from the requested thinking setting. Exercise every byte split. */
+static void test_openai_thinking_boundaries_preserve_text(void) {
+    struct { const char *raw, *reasoning, *content; bool prefilled; int opened, closed; } cases[] = {
+        {"  plain\n\t", "", "  plain\n\t", false, 0, 0},
+        {"<think></think>\n\n  answer", "", "\n\n  answer", false, 1, 1},
+        {"<think> \t\n</think>\tfinal\n", " \t\n", "\tfinal\n", false, 1, 1},
+        {"\ninside</think>  outside", "\ninside", "  outside", true, 1, 1},
+        {"</think>", "", "", true, 1, 1},
+        {"<think></think><think>second</think>end", "second", "end", false, 2, 2},
+        {"<think>\nunfinished", "\nunfinished", "", false, 1, 0},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        for (size_t split = 0; split <= strlen(cases[c].raw); split++) {
+            int sv[2];
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            r.api = API_OPENAI;
+            r.stream = true;
+            r.think_mode = cases[c].prefilled ? DS4_THINK_HIGH : DS4_THINK_NONE;
+            openai_stream st;
+            openai_stream_start(&r, &st);
+            char *prefix = xstrndup(cases[c].raw, split);
+            TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "boundary", &st,
+                                                 prefix, split, false));
+            TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "boundary", &st,
+                                                 cases[c].raw, strlen(cases[c].raw), true));
+            free(prefix);
+            shutdown(sv[0], SHUT_WR);
+            char *out = read_socket_text(sv[1]);
+            buf reasoning = {0}, content = {0};
+            int opened = 0, closed = 0;
+            const char *cursor = out;
+            while ((cursor = strstr(cursor, "\"delta\":{")) != NULL) {
+                cursor += strlen("\"delta\":{");
+                char *field = NULL, *value = NULL;
+                TEST_ASSERT(json_string(&cursor, &field));
+                TEST_ASSERT(*cursor++ == ':');
+                TEST_ASSERT(json_string(&cursor, &value));
+                if (!strcmp(field, "reasoning_block")) {
+                    if (!strcmp(value, "started")) opened++;
+                    if (!strcmp(value, "completed")) closed++;
+                } else if (!strcmp(field, "reasoning_content")) buf_puts(&reasoning, value);
+                else if (!strcmp(field, "content")) buf_puts(&content, value);
+                free(field); free(value);
+            }
+            TEST_ASSERT(opened == cases[c].opened);
+            TEST_ASSERT(closed == cases[c].closed);
+            TEST_ASSERT(!strcmp(reasoning.ptr ? reasoning.ptr : "", cases[c].reasoning));
+            TEST_ASSERT(!strcmp(content.ptr ? content.ptr : "", cases[c].content));
+            buf_free(&reasoning); buf_free(&content); free(out);
+            openai_stream_free(&st); request_free(&r); close(sv[0]); close(sv[1]);
+        }
+    }
+}
+
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -22081,6 +22168,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
+    test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
