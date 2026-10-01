@@ -6947,6 +6947,80 @@ done:
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* Exercise the embedded path on the same model/session engine as native decode.
+ * This documents the transport refactor; its unit regressions fail without the
+ * native writers, and this path never creates a socket or JSON request. */
+static void test_native_chat_generation(void) {
+    ds4_engine *engine = test_get_engine(false);
+    server s = {.engine = engine, .ctx_size = 1024, .slot_count = 1};
+    s.slots = calloc(1, sizeof(*s.slots));
+    s.tool_mem.max_entries = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS;
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    pthread_cond_init(&s.clients_cv, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_mutex_init(&s.kv_mu, NULL);
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s.inference_mu, &attr);
+    pthread_mutexattr_destroy(&attr);
+    pthread_mutex_init(&s.model_mu, NULL);
+    pthread_cond_init(&s.model_cv, NULL);
+    pthread_mutex_init(&s.trace_mu, NULL);
+    s.slots[0].srv = &s;
+    ds4_session *reference = NULL;
+    const bool session_ok = ds4_session_create(&s.slots[0].session, engine, 1024) == 0;
+    const bool reference_ok = ds4_session_create(&reference, engine, 1024) == 0;
+    TEST_ASSERT(session_ok && reference_ok);
+    job j = {.fd = -1};
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    request_init(&j.req, REQ_CHAT, 8);
+    j.req.model_syntax = server_model_syntax_for_engine(engine);
+    j.req.temperature = 0;
+    j.req.temperature_set = true;
+    j.req.think_mode = DS4_THINK_NONE;
+    j.req.stream = true;
+    j.req.stream_include_usage = true;
+    test_native_event_capture capture = {0};
+    j.req.event_callback = test_capture_native_event;
+    j.req.event_context = &capture;
+    ds4_chat *chat = ds4_chat_create();
+    int message = ds4_chat_add_message(chat, "user", "List the integers from 1 through 100.", NULL, NULL);
+    TEST_ASSERT(message == 0);
+    prepare_chat_prompt(&s, &j.req, &chat->messages, chat->schemas.ptr);
+    char err[256] = {0};
+    const bool prepared = request_tokenize_multimodal_prompt(engine, &s, &j.req,
+        &chat->messages, err, sizeof(err));
+    TEST_ASSERT(prepared);
+    test_chat_turn expected = {0};
+    bool decoded = false;
+    if (session_ok && reference_ok && prepared) {
+        decoded = test_generate_chat_turn(engine, reference, &j.req, &expected);
+        generate_job(&s, &s.slots[0], &j);
+    }
+    TEST_ASSERT(decoded);
+    TEST_ASSERT(capture.error_status == 0);
+    TEST_ASSERT(capture.done == 1);
+    TEST_ASSERT(capture.finish.ptr && expected.finish && !strcmp(capture.finish.ptr, expected.finish));
+    TEST_ASSERT(capture.text.ptr && expected.content && !strcmp(capture.text.ptr, expected.content));
+    TEST_ASSERT(capture.prompt_tokens == j.req.prompt.len);
+    TEST_ASSERT(capture.completion_tokens == 8);
+    TEST_ASSERT(!job_cancelled(&j));
+    TEST_ASSERT(s.slots[0].running == NULL);
+    buf_free(&capture.text); buf_free(&capture.reasoning); buf_free(&capture.finish);
+    test_chat_turn_free(&expected);
+    ds4_chat_free(chat);
+    request_free(&j.req);
+    pthread_cond_destroy(&j.cv);
+    pthread_mutex_destroy(&j.mu);
+    ds4_session_free(reference);
+    s.engine = NULL; /* test_get_engine owns the shared model. */
+    server_close_resources(&s);
+    test_close_engine(false);
+}
+
 static void test_tool_call_quality(void) {
     fprintf(stderr, "ds4-test: tool-call quality fast path\n");
     test_tool_call_quality_one(false);
@@ -7218,6 +7292,7 @@ static const ds4_test_entry test_entries[] = {
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
+    {"--native-chat", "native-chat", "native messages and events generate without HTTP or JSON transport", test_native_chat_generation},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},

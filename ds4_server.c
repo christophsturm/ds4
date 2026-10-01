@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_chat.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -502,14 +503,10 @@ static bool server_image_media_type(const char *media_type) {
             !strcasecmp(media_type, "image/jpg"));
 }
 
-static bool server_image_inputs_push_base64(server_image_inputs *images,
-                                            const char *media_type,
-                                            const char *base64,
-                                            char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    if (!server_image_media_type(media_type)) return false;
-    server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
-        return false;
+/* Takes ownership of decoded bytes and inserts the model's opaque image marker. */
+static bool server_image_inputs_push_owned(server_image_inputs *images,
+                                           server_image_input image,
+                                           char marker[SERVER_IMAGE_MARKER_BYTES]) {
     unsigned char nonce[12];
     if (!random_bytes(nonce, sizeof(nonce))) {
         uint64_t fallback = (uint64_t)time(NULL) ^
@@ -535,6 +532,16 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
     images->v[images->len++] = image;
     snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", image.marker);
     return true;
+}
+
+static bool server_image_inputs_push_base64(server_image_inputs *images,
+                                            const char *media_type,
+                                            const char *base64,
+                                            char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    if (!server_image_media_type(media_type)) return false;
+    server_image_input image = {0};
+    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len)) return false;
+    return server_image_inputs_push_owned(images, image, marker);
 }
 
 static bool server_image_inputs_push_data_uri(
@@ -856,6 +863,8 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    ds4_chat_event_callback event_callback;
+    void *event_context;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -3641,6 +3650,98 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+/* The embedded API owns the same values populated by the HTTP parsers. */
+struct ds4_chat {
+    chat_msgs messages;
+    buf schemas;
+    tool_schema_orders orders;
+};
+
+ds4_chat *ds4_chat_create(void) {
+    return calloc(1, sizeof(ds4_chat));
+}
+
+void ds4_chat_free(ds4_chat *chat) {
+    if (!chat) return;
+    chat_msgs_free(&chat->messages);
+    buf_free(&chat->schemas);
+    tool_schema_orders_free(&chat->orders);
+    free(chat);
+}
+
+int ds4_chat_add_message(ds4_chat *chat, const char *role, const char *content,
+                         const char *reasoning, const char *tool_call_id) {
+    if (!chat || !role || !content) return -1;
+    if (strcmp(role, "system") && strcmp(role, "developer") && strcmp(role, "user") &&
+        strcmp(role, "assistant") && strcmp(role, "tool") && strcmp(role, "function")) return -1;
+    chat_msg msg = {.role = xstrdup(role), .content = xstrdup(content),
+                    .reasoning = reasoning ? xstrdup(reasoning) : NULL};
+    if (tool_call_id) chat_msg_add_tool_call_id(&msg, tool_call_id);
+    chat_msgs_push(&chat->messages, msg);
+    return chat->messages.len - 1;
+}
+
+bool ds4_chat_append_text(ds4_chat *chat, int message, const char *text) {
+    if (!chat || message < 0 || message >= chat->messages.len || !text) return false;
+    append_owned_text(&chat->messages.v[message].content, text);
+    return true;
+}
+
+bool ds4_chat_add_tool_call(ds4_chat *chat, int message, const char *id,
+                           const char *name, const char *arguments) {
+    if (!chat || message < 0 || message >= chat->messages.len || !id || !id[0] ||
+        !name || !name[0] || !arguments ||
+        strcmp(chat->messages.v[message].role, "assistant")) return false;
+    const char *p = arguments;
+    json_ws(&p);
+    if (*p != '{' || !json_skip_value(&p)) return false;
+    json_ws(&p);
+    if (*p) return false;
+    tool_call call = {.id = xstrdup(id), .name = xstrdup(name), .arguments = xstrdup(arguments)};
+    tool_calls_push(&chat->messages.v[message].calls, call);
+    return true;
+}
+
+bool ds4_chat_add_tool(ds4_chat *chat, const char *schema) {
+    if (!chat || !schema) return false;
+    const char *p = schema;
+    json_ws(&p);
+    if (*p != '{' || !json_skip_value(&p)) return false;
+    json_ws(&p);
+    if (*p) return false;
+    int before = chat->orders.len;
+    tool_schema_orders_add_json(&chat->orders, schema);
+    if (chat->orders.len != before + 1) return false;
+    if (chat->schemas.len) buf_putc(&chat->schemas, '\n');
+    buf_puts(&chat->schemas, schema);
+    return true;
+}
+
+bool ds4_chat_add_image(ds4_chat *chat, int message, const char *media_type,
+                       const uint8_t *bytes, size_t length) {
+    if (!chat || message < 0 || message >= chat->messages.len || !bytes ||
+        !length || length > 48u * 1024u * 1024u || !server_image_media_type(media_type))
+        return false;
+    chat_msg *msg = &chat->messages.v[message];
+    if (strcmp(msg->role, "user")) return false;
+    size_t image_count = 0;
+    for (int i = 0; i < chat->messages.len; i++) image_count += chat->messages.v[i].images.len;
+    if (image_count >= 16) return false;
+    server_image_input image = {.encoded = xmalloc(length), .encoded_len = length};
+    memcpy(image.encoded, bytes, length);
+    char marker[SERVER_IMAGE_MARKER_BYTES];
+    server_image_inputs_push_owned(&msg->images, image, marker);
+    append_owned_text(&msg->content, marker);
+    return true;
+}
+
+char *ds4_chat_render(const ds4_chat *chat, ds4_engine *engine,
+                      ds4_think_mode thinking, bool tools_enabled) {
+    if (!chat) return NULL;
+    return render_chat_prompt_text_for_syntax(server_model_syntax_for_engine(engine),
+        &chat->messages, tools_enabled ? chat->schemas.ptr : NULL, &chat->orders, thinking);
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -4096,6 +4197,17 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+/* Both native and HTTP histories restore exact tool replay before rendering. */
+static void prepare_chat_prompt(server *s, request *r, chat_msgs *msgs,
+                                 const char *tool_schemas) {
+    kv_cache_restore_tool_memory_for_messages(s, msgs);
+    tool_memory_attach_to_messages(s, msgs, &r->tool_replay);
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    r->prompt_preserves_reasoning = chat_history_uses_tool_context(msgs, active_tool_schemas);
+    r->prompt_text = render_chat_prompt_text_for_syntax(
+        r->model_syntax, msgs, active_tool_schemas, &r->tool_orders, r->think_mode);
+}
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -4268,14 +4380,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    kv_cache_restore_tool_memory_for_messages(s, &msgs);
-    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+    prepare_chat_prompt(s, r, &msgs, tool_schemas);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         free(tool_schemas);
@@ -6961,6 +7066,13 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
     snprintf(msg, sizeof(msg),
              "Prompt has %d tokens, but the configured context size is %d tokens",
              n_prompt_tokens, ctx_size);
+    if (r && r->event_callback) {
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_ERROR, .text = msg, .text_length = strlen(msg),
+            .error_status = 400, .current = n_prompt_tokens, .total = ctx_size,
+        };
+        return r->event_callback(r->event_context, &event);
+    }
 
     if (r && r->api == API_ANTHROPIC) {
         buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
@@ -6989,7 +7101,8 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
-static bool sse_headers(int fd, bool enable_cors) {
+static bool sse_headers(int fd, bool enable_cors, const request *r) {
+    if (r && r->event_callback) return true;
     buf h = {0};
     buf_puts(&h,
         "HTTP/1.1 200 OK\r\n"
@@ -7002,8 +7115,16 @@ static bool sse_headers(int fd, bool enable_cors) {
     return ok;
 }
 
+/* Errors use the same diagnostic before any transport encoding. */
 static bool sse_error_event(int fd, const request *r, const char *msg) {
     const char *message = msg && msg[0] ? msg : "internal server error";
+    if (r && r->event_callback) {
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_ERROR, .text = message,
+            .text_length = strlen(message), .error_status = 500,
+        };
+        return r->event_callback(r->event_context, &event);
+    }
     buf b = {0};
     if (r && r->api == API_ANTHROPIC) {
         buf_puts(&b, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":");
@@ -7019,7 +7140,23 @@ static bool sse_error_event(int fd, const request *r, const char *msg) {
     return ok;
 }
 
+/* The initial HTTP role chunk has no native payload; content and finish do. */
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
+    if (r->event_callback) {
+        if (text) {
+            const ds4_chat_event event = {
+                .kind = DS4_CHAT_CONTENT, .text = text, .text_length = strlen(text),
+            };
+            if (!r->event_callback(r->event_context, &event)) return false;
+        }
+        if (finish) {
+            const ds4_chat_event event = {
+                .kind = DS4_CHAT_FINISH, .text = finish, .text_length = strlen(finish),
+            };
+            return r->event_callback(r->event_context, &event);
+        }
+        return true;
+    }
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -7073,9 +7210,20 @@ static void append_openai_usage_json(buf *b, const request *r,
                cached_tokens, cache_write_tokens);
 }
 
+/* Reports the same bounded cache counters through either transport. */
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
+    if (r->event_callback) {
+        const int cached = clamp_usage_tokens(r->cache_read_tokens, prompt_tokens);
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_USAGE,
+            .prompt_tokens = prompt_tokens, .completion_tokens = completion_tokens,
+            .cache_read_tokens = cached,
+            .cache_write_tokens = clamp_usage_tokens(r->cache_write_tokens, prompt_tokens - cached),
+        };
+        return r->event_callback(r->event_context, &event);
+    }
 
     buf b = {0};
     long now = (long)time(NULL);
@@ -7096,10 +7244,15 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
     return ok;
 }
 
+/* Completion is observable only after all requested usage was delivered. */
 static bool sse_done(int fd, const request *r, const char *id,
                      int prompt_tokens, int completion_tokens) {
-    return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
-           send_all(fd, "data: [DONE]\n\n", 14);
+    if (!sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens)) return false;
+    if (r->event_callback) {
+        const ds4_chat_event event = {.kind = DS4_CHAT_DONE};
+        return r->event_callback(r->event_context, &event);
+    }
+    return send_all(fd, "data: [DONE]\n\n", 14);
 }
 
 static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
@@ -7252,9 +7405,21 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
 
+/* Embedded consumers receive the stream parser's exact bytes before encoding. */
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
     if (len == 0) return true;
+    if (r->event_callback) {
+        ds4_chat_event event = {.text = text, .text_length = len};
+        if (!strcmp(field, "content")) event.kind = DS4_CHAT_CONTENT;
+        else if (!strcmp(field, "reasoning_content")) event.kind = DS4_CHAT_REASONING;
+        else if (!strcmp(field, "reasoning_block") && len == 7 &&
+                 !memcmp(text, "started", 7)) event.kind = DS4_CHAT_REASONING_STARTED;
+        else if (!strcmp(field, "reasoning_block") && len == 9 &&
+                 !memcmp(text, "completed", 9)) event.kind = DS4_CHAT_REASONING_COMPLETED;
+        else return false;
+        return r->event_callback(r->event_context, &event);
+    }
     buf b = {0};
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -7277,6 +7442,13 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
 static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char *id,
                                            int index, const char *tool_id,
                                            const char *name) {
+    if (r->event_callback) {
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_TOOL_START, .tool_index = index,
+            .tool_id = tool_id, .tool_name = name,
+        };
+        return r->event_callback(r->event_context, &event);
+    }
     buf b = {0};
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -7293,9 +7465,17 @@ static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char 
     return ok;
 }
 
+/* Argument fragments are already in the model parser's native JSON form. */
 static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char *id,
                                             int index, const char *text, size_t len) {
     if (len == 0) return true;
+    if (r->event_callback) {
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_TOOL_ARGUMENTS, .tool_index = index,
+            .text = text, .text_length = len,
+        };
+        return r->event_callback(r->event_context, &event);
+    }
     buf b = {0};
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -8160,12 +8340,33 @@ next_block:
     return true;
 }
 
+/* Flushes the shared parser before final calls, finish, usage and completion. */
 static bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                    openai_stream *st, const char *raw,
                                    size_t raw_len, const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
                                    int completion_tokens) {
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+
+    if (r->event_callback) {
+        if (calls && calls->len && !st->tool.emitted_any) {
+            for (int i = 0; i < calls->len; i++) {
+                const tool_call *call = &calls->v[i];
+                char generated_id[128];
+                snprintf(generated_id, sizeof(generated_id), "%s_tool_%d", id, i);
+                if (!sse_chat_tool_call_start_delta(fd, r, id, i,
+                    call->id ? call->id : generated_id, call->name ? call->name : "")) return false;
+                buf arguments = {0};
+                append_json_object_or_empty(&arguments, call->arguments);
+                const bool delivered = sse_chat_tool_call_args_delta_n(
+                    fd, r, id, i, arguments.ptr, arguments.len);
+                buf_free(&arguments);
+                if (!delivered) return false;
+            }
+        }
+        return sse_chunk(fd, r, id, NULL, finish) &&
+               sse_done(fd, r, id, prompt_tokens, completion_tokens);
+    }
 
     buf b = {0};
     long now = (long)time(NULL);
@@ -12690,12 +12891,25 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf_free(&names);
 }
 
+/* Native progress shares cancellation with decode and avoids socket keepalives. */
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || job_cancelled(p->request_job)) return;
     const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
+    if (p->stream && p->request_job && p->request_job->req.event_callback) {
+        const request *r = &p->request_job->req;
+        const ds4_chat_event update = {
+            .kind = DS4_CHAT_PREFILL, .text = event, .text_length = strlen(event),
+            .current = current, .total = total,
+        };
+        if (!r->event_callback(r->event_context, &update)) {
+            p->stream_failed = true;
+            job_mark_cancelled(p->request_job);
+            return;
+        }
+    }
 
     double now = now_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
@@ -12706,7 +12920,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (p->stream && p->fd >= 0 && !p->stream_failed) {
         if (!p->headers_sent) {
             p->headers_sent = true;
-            if (sse_headers(p->fd, p->enable_cors)) {
+            if (sse_headers(p->fd, p->enable_cors, p->request_job ? &p->request_job->req : NULL)) {
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
@@ -12773,10 +12987,16 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
 }
 
+/* Native clients receive failures even before streaming would send headers. */
 static void send_prefill_failure_response(server *s, const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
                                           const char *err) {
+    if (j->req.event_callback) {
+        if (!progress || !progress->stream_failed)
+            sse_error_event(j->fd, &j->req, err);
+        return;
+    }
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
@@ -13866,7 +14086,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         /* The prefill progress callback may have already sent the SSE headers
          * to keep the connection alive during a long prefill. Only emit them
          * here when prefill never fired (e.g. fully cached prompt). */
-        if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
+        if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors, &j->req)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
@@ -17202,7 +17422,7 @@ static void test_cors_sse_headers(void) {
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
 
-    TEST_ASSERT(sse_headers(sv[0], true));
+    TEST_ASSERT(sse_headers(sv[0], true, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
     TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
@@ -17759,6 +17979,342 @@ static void test_openai_thinking_boundaries_preserve_text(void) {
             openai_stream_free(&st); request_free(&r); close(sv[0]); close(sv[1]);
         }
     }
+}
+
+/* Records native bytes without any HTTP or JSON decoder in the test. */
+typedef struct {
+    buf text, reasoning, arguments[2], names[2], ids[2], finish;
+    ds4_chat_event_kind kind;
+    int count, reasoning_started, reasoning_completed, tool_starts[2], done;
+    int prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens;
+    bool invalid_tool_index, stop_after_event;
+    int current, total, error_status;
+} test_native_event_capture;
+
+static bool test_capture_native_event(void *context, const ds4_chat_event *event) {
+    test_native_event_capture *capture = context;
+    capture->kind = event->kind;
+    capture->count++;
+    switch (event->kind) {
+    case DS4_CHAT_CONTENT:
+        buf_append(&capture->text, event->text, event->text_length); break;
+    case DS4_CHAT_REASONING:
+        buf_append(&capture->reasoning, event->text, event->text_length); break;
+    case DS4_CHAT_REASONING_STARTED: capture->reasoning_started++; break;
+    case DS4_CHAT_REASONING_COMPLETED: capture->reasoning_completed++; break;
+    case DS4_CHAT_TOOL_START:
+    case DS4_CHAT_TOOL_ARGUMENTS:
+        if (event->tool_index < 0 || event->tool_index >= 2) {
+            capture->invalid_tool_index = true;
+            return false;
+        }
+        if (event->kind == DS4_CHAT_TOOL_START) {
+            capture->tool_starts[event->tool_index]++;
+            buf_puts(&capture->names[event->tool_index], event->tool_name);
+            buf_puts(&capture->ids[event->tool_index], event->tool_id);
+        } else {
+            buf_append(&capture->arguments[event->tool_index], event->text, event->text_length);
+        }
+        break;
+    case DS4_CHAT_FINISH: buf_append(&capture->finish, event->text, event->text_length); break;
+    case DS4_CHAT_USAGE:
+        capture->prompt_tokens = event->prompt_tokens;
+        capture->completion_tokens = event->completion_tokens;
+        capture->cache_read_tokens = event->cache_read_tokens;
+        capture->cache_write_tokens = event->cache_write_tokens;
+        break;
+    case DS4_CHAT_ERROR:
+        capture->error_status = event->error_status;
+        buf_append(&capture->text, event->text, event->text_length);
+        break;
+    case DS4_CHAT_DONE: capture->done++; break;
+    case DS4_CHAT_PREFILL:
+        capture->current = event->current; capture->total = event->total; break;
+    default: break;
+    }
+    return !capture->stop_after_event;
+}
+
+static void test_native_chat_content_preserves_bytes(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 73);
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    const char content[] = "  quote=\"hello\"\n猫\\path\t";
+    const bool delivered = sse_chat_delta_n(-1, &r, "native-content",
+                                           "content", content, sizeof(content) - 1);
+    TEST_ASSERT(delivered);
+    TEST_ASSERT(capture.count == 1);
+    TEST_ASSERT(capture.kind == DS4_CHAT_CONTENT);
+    TEST_ASSERT(capture.text.len == sizeof(content) - 1);
+    TEST_ASSERT(capture.text.ptr && !memcmp(capture.text.ptr, content, sizeof(content) - 1));
+    buf_free(&capture.text);
+    request_free(&r);
+}
+
+/* The native and HTTP transports share model parsing and exact replay IDs. */
+static void test_native_chat_streams_tools_and_completion(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 211);
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    r.stream = true;
+    r.stream_include_usage = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.cache_read_tokens = 17;
+    r.cache_write_tokens = 26;
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *prefix =
+        "<think>inspect first</think>visible answer\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read_alpha\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">first";
+    const char *raw =
+        "<think>inspect first</think>visible answer\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read_alpha\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">first-file"
+        DS4_PARAM_END "\n" DS4_INVOKE_END "\n"
+        DS4_INVOKE_START " name=\"write_beta\">\n"
+        DS4_PARAM_START " name=\"values\" string=\"false\">[3,true,null]"
+        DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+    const bool prefix_ok = openai_sse_stream_update(-1, NULL, &r, "native-tools", &st,
+                                                   prefix, strlen(prefix), false);
+    const bool full_ok = openai_sse_stream_update(-1, NULL, &r, "native-tools", &st,
+                                                 raw, strlen(raw), false);
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    const bool parsed = parse_generated_message_ex(raw, true, &content, &reasoning, &calls);
+    apply_openai_stream_tool_ids(&calls, &st);
+    const bool finished = openai_sse_finish_live(-1, NULL, &r, "native-tools", &st,
+                                                raw, strlen(raw), &calls, "tool_calls", 43, 59);
+    TEST_ASSERT(prefix_ok && full_ok && parsed && finished);
+    TEST_ASSERT(!capture.invalid_tool_index);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "visible answer"));
+    TEST_ASSERT(capture.reasoning.ptr && !strcmp(capture.reasoning.ptr, "inspect first"));
+    TEST_ASSERT(capture.reasoning_started == 1 && capture.reasoning_completed == 1);
+    TEST_ASSERT(capture.tool_starts[0] == 1 && capture.tool_starts[1] == 1);
+    TEST_ASSERT(capture.names[0].ptr && !strcmp(capture.names[0].ptr, "read_alpha"));
+    TEST_ASSERT(capture.names[1].ptr && !strcmp(capture.names[1].ptr, "write_beta"));
+    TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr, "{\"path\":\"first-file\"}"));
+    TEST_ASSERT(capture.arguments[1].ptr && !strcmp(capture.arguments[1].ptr, "{\"values\":[3,true,null]}"));
+    TEST_ASSERT(calls.len == 2);
+    TEST_ASSERT(capture.ids[0].ptr && calls.len == 2 && !strcmp(capture.ids[0].ptr, calls.v[0].id));
+    TEST_ASSERT(capture.ids[1].ptr && calls.len == 2 && !strcmp(capture.ids[1].ptr, calls.v[1].id));
+    TEST_ASSERT(capture.ids[0].ptr && capture.ids[1].ptr && strcmp(capture.ids[0].ptr, capture.ids[1].ptr));
+    TEST_ASSERT(capture.finish.ptr && !strcmp(capture.finish.ptr, "tool_calls"));
+    TEST_ASSERT(capture.prompt_tokens == 43 && capture.completion_tokens == 59);
+    TEST_ASSERT(capture.cache_read_tokens == 17 && capture.cache_write_tokens == 26);
+    TEST_ASSERT(capture.done == 1 && capture.kind == DS4_CHAT_DONE);
+    free(content); free(reasoning); tool_calls_free(&calls); openai_stream_free(&st);
+    buf_free(&capture.text); buf_free(&capture.reasoning); buf_free(&capture.finish);
+    for (int i = 0; i < 2; i++) {
+        buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
+    }
+    request_free(&r);
+}
+
+/* Existing model parsers must preserve identical native values at every byte split. */
+static void test_native_stream_model_syntax_and_utf8_boundaries(void) {
+    const struct { server_model_syntax syntax; const char *tool; } cases[] = {
+        {SERVER_MODEL_SYNTAX_DEEPSEEK,
+         DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">\n"
+         DS4_PARAM_START " name=\"command\" string=\"true\">cat 🐈" DS4_PARAM_END "\n"
+         DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END},
+        {SERVER_MODEL_SYNTAX_DEEPSEEK41,
+         DS41_TOOL_CALLS_START "\n" DS41_INVOKE_START " name=\"bash\">\n"
+         DS41_PARAM_START " name=\"command\" string=\"true\">cat 🐈" DS41_PARAM_END "\n"
+         DS41_INVOKE_END "\n" DS41_TOOL_CALLS_END},
+        {SERVER_MODEL_SYNTAX_GLM,
+         "<tool_call>bash<arg_key>command</arg_key><arg_value>cat 🐈</arg_value></tool_call>"},
+        {SERVER_MODEL_SYNTAX_QWEN,
+         "<tool_call><function=bash><parameter=command>cat 🐈</parameter></function></tool_call>"},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        buf raw = {0};
+        buf_puts(&raw, "<think>thought猫</think>answer犬\n\n");
+        buf_puts(&raw, cases[c].tool);
+        for (size_t split = 0; split <= raw.len; split++) {
+            request r;
+            request_init(&r, REQ_CHAT, 109);
+            test_native_event_capture capture = {0};
+            r.event_callback = test_capture_native_event;
+            r.event_context = &capture;
+            r.stream = true;
+            r.stream_include_usage = true;
+            r.think_mode = DS4_THINK_HIGH;
+            r.has_tools = true;
+            r.model_syntax = cases[c].syntax;
+            r.tool_orders = make_bash_order();
+            openai_stream st;
+            openai_stream_start(&r, &st);
+            char *prefix = xstrndup(raw.ptr, split);
+            bool first = openai_sse_stream_update(-1, NULL, &r, "split", &st, prefix, split, false);
+            bool second = openai_sse_stream_update(-1, NULL, &r, "split", &st, raw.ptr, raw.len, true);
+            char *content = NULL, *reasoning = NULL;
+            tool_calls calls = {0};
+            const char *finish = "tool_calls";
+            char err[160] = {0};
+            bool recovered = false;
+            bool parsed = parse_generated_message_for_response_for_syntax(r.model_syntax,
+                raw.ptr, true, true, true, &finish, err, sizeof(err), &content, &reasoning,
+                &calls, &recovered, &r.tool_orders);
+            apply_openai_stream_tool_ids(&calls, &st);
+            bool completed = openai_sse_finish_live(-1, NULL, &r, "split", &st,
+                raw.ptr, raw.len, &calls, finish, 23, 31);
+            TEST_ASSERT(first && second && parsed && completed);
+            TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "answer犬"));
+            TEST_ASSERT(capture.reasoning.ptr && !strcmp(capture.reasoning.ptr, "thought猫"));
+            TEST_ASSERT(capture.reasoning_started == 1 && capture.reasoning_completed == 1);
+            TEST_ASSERT(capture.tool_starts[0] == 1 && capture.tool_starts[1] == 0);
+            TEST_ASSERT(capture.names[0].ptr && !strcmp(capture.names[0].ptr, "bash"));
+            TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr, "{\"command\":\"cat 🐈\"}"));
+            TEST_ASSERT(capture.done == 1 && !capture.invalid_tool_index);
+            buf_free(&capture.text); buf_free(&capture.reasoning); buf_free(&capture.finish);
+            for (int i = 0; i < 2; i++) {
+                buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
+            }
+            free(prefix); free(content); free(reasoning); tool_calls_free(&calls);
+            openai_stream_free(&st); request_free(&r);
+        }
+        buf_free(&raw);
+    }
+}
+
+static void test_native_chat_copies_images_in_message_order(void) {
+    ds4_chat *chat = ds4_chat_create();
+    int user = ds4_chat_add_message(chat, "user", "before ", NULL, NULL);
+    uint8_t png[] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+    const uint8_t jpeg[] = {0xff, 0xd8, 0xff, 0xe0};
+    bool first = ds4_chat_add_image(chat, user, "image/png", png, sizeof(png));
+    bool middle = ds4_chat_append_text(chat, user, " middle ");
+    bool second = ds4_chat_add_image(chat, user, "image/jpeg", jpeg, sizeof(jpeg));
+    bool end = ds4_chat_append_text(chat, user, " after");
+    png[0] = 0;
+    TEST_ASSERT(first && middle && second && end);
+    TEST_ASSERT(chat->messages.v[user].images.len == 2);
+    bool bytes_equal = false, ordered = false, distinct = false;
+    if (chat->messages.v[user].images.len == 2) {
+        const server_image_input *a = &chat->messages.v[user].images.v[0];
+        const server_image_input *b = &chat->messages.v[user].images.v[1];
+        bytes_equal = a->encoded_len == 8 && !memcmp(a->encoded, "\x89PNG\r\n\x1a\n", 8) &&
+                      b->encoded_len == 4 && !memcmp(b->encoded, jpeg, 4);
+        buf expected = {0};
+        buf_printf(&expected, "before %s middle %s after", a->marker, b->marker);
+        ordered = !strcmp(chat->messages.v[user].content, expected.ptr);
+        distinct = strcmp(a->marker, b->marker) != 0;
+        buf_free(&expected);
+    }
+    TEST_ASSERT(bytes_equal && ordered && distinct);
+    ds4_chat_free(chat);
+}
+
+static void test_native_chat_renders_history_and_tools(void) {
+    ds4_chat *chat = ds4_chat_create();
+    int system = ds4_chat_add_message(chat, "system", "native instruction", NULL, NULL);
+    int user = ds4_chat_add_message(chat, "user", "quote=\"猫\"\\path\n", NULL, NULL);
+    int assistant = ds4_chat_add_message(chat, "assistant", "visible text", "private plan", NULL);
+    bool call = ds4_chat_add_tool_call(chat, assistant, "native-call-17", "inspect_file",
+                                      "{\"path\":\"file-alpha\",\"mode\":\"brief\"}");
+    int tool = ds4_chat_add_message(chat, "tool", "tool result beta", NULL, "native-call-17");
+    int next = ds4_chat_add_message(chat, "user", "next question", NULL, NULL);
+    bool appended = ds4_chat_append_text(chat, next, " with detail");
+    bool schema = ds4_chat_add_tool(chat,
+        "{\"name\":\"inspect_file\",\"description\":\"Read a file\",\"parameters\":{"
+        "\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\"},"
+        "\"path\":{\"type\":\"string\"}}}}");
+    char *prompt = ds4_chat_render(chat, NULL, DS4_THINK_HIGH, true);
+    TEST_ASSERT(system == 0 && user == 1 && assistant == 2 && tool == 3 && next == 4);
+    TEST_ASSERT(call && schema && appended);
+    TEST_ASSERT(prompt && strstr(prompt, "native instruction<｜User｜>quote=\"猫\"\\path\n"));
+    TEST_ASSERT(prompt && strstr(prompt, "<think>private plan</think>visible text"));
+    TEST_ASSERT(prompt && strstr(prompt, "<tool_result>tool result beta</tool_result>"));
+    TEST_ASSERT(prompt && strstr(prompt, "next question with detail<｜Assistant｜><think>"));
+    /* DeepSeek's existing renderer keeps argument order; GLM uses schema order. */
+    TEST_ASSERT(prompt && strstr(prompt, "name=\"path\" string=\"true\">file-alpha</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"mode\" string=\"true\">brief</｜DSML｜parameter>"));
+    TEST_ASSERT(chat && chat->messages.len == 5);
+    free(prompt);
+    ds4_chat_free(chat);
+}
+
+static void test_native_context_error_preserves_token_counts(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 103);
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    TEST_ASSERT(http_error_context_length_exceeded(-1, false, &r, 127, 113));
+    TEST_ASSERT(capture.count == 1 && capture.kind == DS4_CHAT_ERROR);
+    TEST_ASSERT(capture.error_status == 400);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr,
+        "Prompt has 127 tokens, but the configured context size is 113 tokens"));
+    buf_free(&capture.text);
+    request_free(&r);
+}
+
+static void test_native_stream_does_not_require_socket_headers(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 101);
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    TEST_ASSERT(sse_headers(-1, false, &r));
+    TEST_ASSERT(capture.count == 0);
+    request_free(&r);
+}
+
+static void test_native_prefill_errors_preserve_diagnostics(void) {
+    job j = {.fd = -1};
+    request_init(&j.req, REQ_CHAT, 97);
+    test_native_event_capture capture = {0};
+    j.req.event_callback = test_capture_native_event;
+    j.req.event_context = &capture;
+    j.req.stream = true;
+    server s = {0};
+    server_prefill_progress progress = {0};
+    send_prefill_failure_response(&s, &j, &progress, "native-before", "", "first\n\"failure\"");
+    TEST_ASSERT(capture.count == 1);
+    TEST_ASSERT(capture.kind == DS4_CHAT_ERROR && capture.error_status == 500);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "first\n\"failure\""));
+    buf_free(&capture.text);
+    progress.headers_sent = true;
+    send_prefill_failure_response(&s, &j, &progress, "native-after", "", "second\\failure");
+    TEST_ASSERT(capture.count == 2);
+    TEST_ASSERT(capture.kind == DS4_CHAT_ERROR && capture.error_status == 500);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "second\\failure"));
+    buf_free(&capture.text);
+    progress.stream_failed = true;
+    send_prefill_failure_response(&s, &j, &progress, "native-closed", "", "ignored failure");
+    TEST_ASSERT(capture.count == 2);
+    request_free(&j.req);
+}
+
+static void test_native_prefill_callback_cancels_generation(void) {
+    job j = {.fd = -1};
+    pthread_mutex_init(&j.mu, NULL);
+    request_init(&j.req, REQ_CHAT, 89);
+    test_native_event_capture capture = {.stop_after_event = true};
+    j.req.event_callback = test_capture_native_event;
+    j.req.event_context = &capture;
+    j.req.stream = true;
+    server_prefill_progress progress = {
+        .fd = -1, .stream = true, .request_job = &j, .t0 = now_sec(),
+        .kind = REQ_CHAT, .prompt_tokens = 71,
+    };
+    server_progress_cb(&progress, "prefill_chunk", 13, 71);
+    server_progress_cb(&progress, "prefill_display", 19, 83);
+    TEST_ASSERT(capture.count == 1);
+    TEST_ASSERT(capture.kind == DS4_CHAT_PREFILL);
+    TEST_ASSERT(capture.current == 13 && capture.total == 71);
+    TEST_ASSERT(progress.stream_failed);
+    TEST_ASSERT(job_cancelled(&j));
+    request_free(&j.req);
+    pthread_mutex_destroy(&j.mu);
 }
 
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
@@ -23078,6 +23634,15 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_stream_split_reasoning_close();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
+    test_native_chat_content_preserves_bytes();
+    test_native_chat_streams_tools_and_completion();
+    test_native_prefill_callback_cancels_generation();
+    test_native_prefill_errors_preserve_diagnostics();
+    test_native_stream_does_not_require_socket_headers();
+    test_native_context_error_preserves_token_counts();
+    test_native_chat_renders_history_and_tools();
+    test_native_chat_copies_images_in_message_order();
+    test_native_stream_model_syntax_and_utf8_boundaries();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
