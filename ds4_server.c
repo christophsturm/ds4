@@ -12773,12 +12773,25 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf_free(&names);
 }
 
+/* Native progress shares cancellation with decode and avoids socket keepalives. */
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || job_cancelled(p->request_job)) return;
     const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
+    if (p->stream && p->request_job && p->request_job->req.event_callback) {
+        const request *r = &p->request_job->req;
+        const ds4_chat_event update = {
+            .kind = DS4_CHAT_PREFILL, .text = event, .text_length = strlen(event),
+            .current = current, .total = total,
+        };
+        if (!r->event_callback(r->event_context, &update)) {
+            p->stream_failed = true;
+            job_mark_cancelled(p->request_job);
+            return;
+        }
+    }
 
     double now = now_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
@@ -17850,7 +17863,8 @@ typedef struct {
     ds4_chat_event_kind kind;
     int count, reasoning_started, reasoning_completed, tool_starts[2], done;
     int prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens;
-    bool invalid_tool_index;
+    bool invalid_tool_index, stop_after_event;
+    int current, total;
 } test_native_event_capture;
 
 static bool test_capture_native_event(void *context, const ds4_chat_event *event) {
@@ -17886,9 +17900,11 @@ static bool test_capture_native_event(void *context, const ds4_chat_event *event
         capture->cache_write_tokens = event->cache_write_tokens;
         break;
     case DS4_CHAT_DONE: capture->done++; break;
+    case DS4_CHAT_PREFILL:
+        capture->current = event->current; capture->total = event->total; break;
     default: break;
     }
-    return true;
+    return !capture->stop_after_event;
 }
 
 static void test_native_chat_content_preserves_bytes(void) {
@@ -17972,6 +17988,29 @@ static void test_native_chat_streams_tools_and_completion(void) {
         buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
     }
     request_free(&r);
+}
+
+static void test_native_prefill_callback_cancels_generation(void) {
+    job j = {.fd = -1};
+    pthread_mutex_init(&j.mu, NULL);
+    request_init(&j.req, REQ_CHAT, 89);
+    test_native_event_capture capture = {.stop_after_event = true};
+    j.req.event_callback = test_capture_native_event;
+    j.req.event_context = &capture;
+    j.req.stream = true;
+    server_prefill_progress progress = {
+        .fd = -1, .stream = true, .request_job = &j, .t0 = now_sec(),
+        .kind = REQ_CHAT, .prompt_tokens = 71,
+    };
+    server_progress_cb(&progress, "prefill_chunk", 13, 71);
+    server_progress_cb(&progress, "prefill_display", 19, 83);
+    TEST_ASSERT(capture.count == 1);
+    TEST_ASSERT(capture.kind == DS4_CHAT_PREFILL);
+    TEST_ASSERT(capture.current == 13 && capture.total == 71);
+    TEST_ASSERT(progress.stream_failed);
+    TEST_ASSERT(job_cancelled(&j));
+    request_free(&j.req);
+    pthread_mutex_destroy(&j.mu);
 }
 
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
@@ -23293,6 +23332,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_usage_reports_cache_details();
     test_native_chat_content_preserves_bytes();
     test_native_chat_streams_tools_and_completion();
+    test_native_prefill_callback_cancels_generation();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
