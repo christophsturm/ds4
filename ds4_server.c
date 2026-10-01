@@ -1,5 +1,5 @@
 #include "ds4.h"
-#include "ds4_events.h"
+#include "ds4_chat.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -3642,6 +3642,80 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
     return render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK,
                                               msgs, tool_schemas,
                                               tool_orders, think_mode);
+}
+
+/* The embedded API owns the same values populated by the HTTP parsers. */
+struct ds4_chat {
+    chat_msgs messages;
+    buf schemas;
+    tool_schema_orders orders;
+};
+
+ds4_chat *ds4_chat_create(void) {
+    return calloc(1, sizeof(ds4_chat));
+}
+
+void ds4_chat_free(ds4_chat *chat) {
+    if (!chat) return;
+    chat_msgs_free(&chat->messages);
+    buf_free(&chat->schemas);
+    tool_schema_orders_free(&chat->orders);
+    free(chat);
+}
+
+int ds4_chat_add_message(ds4_chat *chat, const char *role, const char *content,
+                         const char *reasoning, const char *tool_call_id) {
+    if (!chat || !role || !content) return -1;
+    if (strcmp(role, "system") && strcmp(role, "developer") && strcmp(role, "user") &&
+        strcmp(role, "assistant") && strcmp(role, "tool")) return -1;
+    chat_msg msg = {.role = xstrdup(role), .content = xstrdup(content),
+                    .reasoning = reasoning ? xstrdup(reasoning) : NULL};
+    if (tool_call_id) chat_msg_add_tool_call_id(&msg, tool_call_id);
+    chat_msgs_push(&chat->messages, msg);
+    return chat->messages.len - 1;
+}
+
+bool ds4_chat_append_text(ds4_chat *chat, int message, const char *text) {
+    if (!chat || message < 0 || message >= chat->messages.len || !text) return false;
+    append_owned_text(&chat->messages.v[message].content, text);
+    return true;
+}
+
+bool ds4_chat_add_tool_call(ds4_chat *chat, int message, const char *id,
+                           const char *name, const char *arguments) {
+    if (!chat || message < 0 || message >= chat->messages.len || !id || !id[0] ||
+        !name || !name[0] || !arguments ||
+        strcmp(chat->messages.v[message].role, "assistant")) return false;
+    const char *p = arguments;
+    json_ws(&p);
+    if (*p != '{' || !json_skip_value(&p)) return false;
+    json_ws(&p);
+    if (*p) return false;
+    tool_call call = {.id = xstrdup(id), .name = xstrdup(name), .arguments = xstrdup(arguments)};
+    tool_calls_push(&chat->messages.v[message].calls, call);
+    return true;
+}
+
+bool ds4_chat_add_tool(ds4_chat *chat, const char *schema) {
+    if (!chat || !schema) return false;
+    const char *p = schema;
+    json_ws(&p);
+    if (*p != '{' || !json_skip_value(&p)) return false;
+    json_ws(&p);
+    if (*p) return false;
+    int before = chat->orders.len;
+    tool_schema_orders_add_json(&chat->orders, schema);
+    if (chat->orders.len != before + 1) return false;
+    if (chat->schemas.len) buf_putc(&chat->schemas, '\n');
+    buf_puts(&chat->schemas, schema);
+    return true;
+}
+
+char *ds4_chat_render(const ds4_chat *chat, ds4_engine *engine,
+                      ds4_think_mode thinking, bool tools_enabled) {
+    if (!chat) return NULL;
+    return render_chat_prompt_text_for_syntax(server_model_syntax_for_engine(engine),
+        &chat->messages, tools_enabled ? chat->schemas.ptr : NULL, &chat->orders, thinking);
 }
 
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
@@ -18016,6 +18090,35 @@ static void test_native_chat_streams_tools_and_completion(void) {
     request_free(&r);
 }
 
+static void test_native_chat_renders_history_and_tools(void) {
+    ds4_chat *chat = ds4_chat_create();
+    int system = ds4_chat_add_message(chat, "system", "native instruction", NULL, NULL);
+    int user = ds4_chat_add_message(chat, "user", "quote=\"猫\"\\path\n", NULL, NULL);
+    int assistant = ds4_chat_add_message(chat, "assistant", "visible text", "private plan", NULL);
+    bool call = ds4_chat_add_tool_call(chat, assistant, "native-call-17", "inspect_file",
+                                      "{\"path\":\"file-alpha\",\"mode\":\"brief\"}");
+    int tool = ds4_chat_add_message(chat, "tool", "tool result beta", NULL, "native-call-17");
+    int next = ds4_chat_add_message(chat, "user", "next question", NULL, NULL);
+    bool appended = ds4_chat_append_text(chat, next, " with detail");
+    bool schema = ds4_chat_add_tool(chat,
+        "{\"name\":\"inspect_file\",\"description\":\"Read a file\",\"parameters\":{"
+        "\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\"},"
+        "\"path\":{\"type\":\"string\"}}}}");
+    char *prompt = ds4_chat_render(chat, NULL, DS4_THINK_HIGH, true);
+    TEST_ASSERT(system == 0 && user == 1 && assistant == 2 && tool == 3 && next == 4);
+    TEST_ASSERT(call && schema && appended);
+    TEST_ASSERT(prompt && strstr(prompt, "native instruction<｜User｜>quote=\"猫\"\\path\n"));
+    TEST_ASSERT(prompt && strstr(prompt, "<think>private plan</think>visible text"));
+    TEST_ASSERT(prompt && strstr(prompt, "<tool_result>tool result beta</tool_result>"));
+    TEST_ASSERT(prompt && strstr(prompt, "next question with detail<｜Assistant｜><think>"));
+    /* DeepSeek's existing renderer keeps argument order; GLM uses schema order. */
+    TEST_ASSERT(prompt && strstr(prompt, "name=\"path\" string=\"true\">file-alpha</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"mode\" string=\"true\">brief</｜DSML｜parameter>"));
+    TEST_ASSERT(chat && chat->messages.len == 5);
+    free(prompt);
+    ds4_chat_free(chat);
+}
+
 static void test_native_context_error_preserves_token_counts(void) {
     request r;
     request_init(&r, REQ_CHAT, 103);
@@ -18057,10 +18160,10 @@ static void test_native_prefill_errors_preserve_diagnostics(void) {
     TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "first\n\"failure\""));
     buf_free(&capture.text);
     progress.headers_sent = true;
-    send_prefill_failure_response(&s, &j, &progress, "native-after", "", "second\failure");
+    send_prefill_failure_response(&s, &j, &progress, "native-after", "", "second\\failure");
     TEST_ASSERT(capture.count == 2);
     TEST_ASSERT(capture.kind == DS4_CHAT_ERROR && capture.error_status == 500);
-    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "second\failure"));
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "second\\failure"));
     buf_free(&capture.text);
     progress.stream_failed = true;
     send_prefill_failure_response(&s, &j, &progress, "native-closed", "", "ignored failure");
@@ -23414,6 +23517,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_prefill_errors_preserve_diagnostics();
     test_native_stream_does_not_require_socket_headers();
     test_native_context_error_preserves_token_counts();
+    test_native_chat_renders_history_and_tools();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
