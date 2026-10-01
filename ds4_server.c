@@ -7022,7 +7022,23 @@ static bool sse_error_event(int fd, const request *r, const char *msg) {
     return ok;
 }
 
+/* The initial HTTP role chunk has no native payload; content and finish do. */
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
+    if (r->event_callback) {
+        if (text) {
+            const ds4_chat_event event = {
+                .kind = DS4_CHAT_CONTENT, .text = text, .text_length = strlen(text),
+            };
+            if (!r->event_callback(r->event_context, &event)) return false;
+        }
+        if (finish) {
+            const ds4_chat_event event = {
+                .kind = DS4_CHAT_FINISH, .text = finish, .text_length = strlen(finish),
+            };
+            return r->event_callback(r->event_context, &event);
+        }
+        return true;
+    }
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -7076,9 +7092,20 @@ static void append_openai_usage_json(buf *b, const request *r,
                cached_tokens, cache_write_tokens);
 }
 
+/* Reports the same bounded cache counters through either transport. */
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
+    if (r->event_callback) {
+        const int cached = clamp_usage_tokens(r->cache_read_tokens, prompt_tokens);
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_USAGE,
+            .prompt_tokens = prompt_tokens, .completion_tokens = completion_tokens,
+            .cache_read_tokens = cached,
+            .cache_write_tokens = clamp_usage_tokens(r->cache_write_tokens, prompt_tokens - cached),
+        };
+        return r->event_callback(r->event_context, &event);
+    }
 
     buf b = {0};
     long now = (long)time(NULL);
@@ -7099,10 +7126,15 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
     return ok;
 }
 
+/* Completion is observable only after all requested usage was delivered. */
 static bool sse_done(int fd, const request *r, const char *id,
                      int prompt_tokens, int completion_tokens) {
-    return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
-           send_all(fd, "data: [DONE]\n\n", 14);
+    if (!sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens)) return false;
+    if (r->event_callback) {
+        const ds4_chat_event event = {.kind = DS4_CHAT_DONE};
+        return r->event_callback(r->event_context, &event);
+    }
+    return send_all(fd, "data: [DONE]\n\n", 14);
 }
 
 static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
@@ -7292,6 +7324,13 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
 static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char *id,
                                            int index, const char *tool_id,
                                            const char *name) {
+    if (r->event_callback) {
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_TOOL_START, .tool_index = index,
+            .tool_id = tool_id, .tool_name = name,
+        };
+        return r->event_callback(r->event_context, &event);
+    }
     buf b = {0};
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -7308,9 +7347,17 @@ static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char 
     return ok;
 }
 
+/* Argument fragments are already in the model parser's native JSON form. */
 static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char *id,
                                             int index, const char *text, size_t len) {
     if (len == 0) return true;
+    if (r->event_callback) {
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_TOOL_ARGUMENTS, .tool_index = index,
+            .text = text, .text_length = len,
+        };
+        return r->event_callback(r->event_context, &event);
+    }
     buf b = {0};
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -8175,12 +8222,33 @@ next_block:
     return true;
 }
 
+/* Flushes the shared parser before final calls, finish, usage and completion. */
 static bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                    openai_stream *st, const char *raw,
                                    size_t raw_len, const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
                                    int completion_tokens) {
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+
+    if (r->event_callback) {
+        if (calls && calls->len && !st->tool.emitted_any) {
+            for (int i = 0; i < calls->len; i++) {
+                const tool_call *call = &calls->v[i];
+                char generated_id[128];
+                snprintf(generated_id, sizeof(generated_id), "%s_tool_%d", id, i);
+                if (!sse_chat_tool_call_start_delta(fd, r, id, i,
+                    call->id ? call->id : generated_id, call->name ? call->name : "")) return false;
+                buf arguments = {0};
+                append_json_object_or_empty(&arguments, call->arguments);
+                const bool delivered = sse_chat_tool_call_args_delta_n(
+                    fd, r, id, i, arguments.ptr, arguments.len);
+                buf_free(&arguments);
+                if (!delivered) return false;
+            }
+        }
+        return sse_chunk(fd, r, id, NULL, finish) &&
+               sse_done(fd, r, id, prompt_tokens, completion_tokens);
+    }
 
     buf b = {0};
     long now = (long)time(NULL);
@@ -17778,16 +17846,48 @@ static void test_openai_thinking_boundaries_preserve_text(void) {
 
 /* Records native bytes without any HTTP or JSON decoder in the test. */
 typedef struct {
-    buf text;
+    buf text, reasoning, arguments[2], names[2], ids[2], finish;
     ds4_chat_event_kind kind;
-    int count;
+    int count, reasoning_started, reasoning_completed, tool_starts[2], done;
+    int prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens;
+    bool invalid_tool_index;
 } test_native_event_capture;
 
 static bool test_capture_native_event(void *context, const ds4_chat_event *event) {
     test_native_event_capture *capture = context;
     capture->kind = event->kind;
     capture->count++;
-    if (event->text) buf_append(&capture->text, event->text, event->text_length);
+    switch (event->kind) {
+    case DS4_CHAT_CONTENT:
+        buf_append(&capture->text, event->text, event->text_length); break;
+    case DS4_CHAT_REASONING:
+        buf_append(&capture->reasoning, event->text, event->text_length); break;
+    case DS4_CHAT_REASONING_STARTED: capture->reasoning_started++; break;
+    case DS4_CHAT_REASONING_COMPLETED: capture->reasoning_completed++; break;
+    case DS4_CHAT_TOOL_START:
+    case DS4_CHAT_TOOL_ARGUMENTS:
+        if (event->tool_index < 0 || event->tool_index >= 2) {
+            capture->invalid_tool_index = true;
+            return false;
+        }
+        if (event->kind == DS4_CHAT_TOOL_START) {
+            capture->tool_starts[event->tool_index]++;
+            buf_puts(&capture->names[event->tool_index], event->tool_name);
+            buf_puts(&capture->ids[event->tool_index], event->tool_id);
+        } else {
+            buf_append(&capture->arguments[event->tool_index], event->text, event->text_length);
+        }
+        break;
+    case DS4_CHAT_FINISH: buf_append(&capture->finish, event->text, event->text_length); break;
+    case DS4_CHAT_USAGE:
+        capture->prompt_tokens = event->prompt_tokens;
+        capture->completion_tokens = event->completion_tokens;
+        capture->cache_read_tokens = event->cache_read_tokens;
+        capture->cache_write_tokens = event->cache_write_tokens;
+        break;
+    case DS4_CHAT_DONE: capture->done++; break;
+    default: break;
+    }
     return true;
 }
 
@@ -17806,6 +17906,71 @@ static void test_native_chat_content_preserves_bytes(void) {
     TEST_ASSERT(capture.text.len == sizeof(content) - 1);
     TEST_ASSERT(capture.text.ptr && !memcmp(capture.text.ptr, content, sizeof(content) - 1));
     buf_free(&capture.text);
+    request_free(&r);
+}
+
+/* The native and HTTP transports share model parsing and exact replay IDs. */
+static void test_native_chat_streams_tools_and_completion(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 211);
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    r.stream = true;
+    r.stream_include_usage = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.cache_read_tokens = 17;
+    r.cache_write_tokens = 26;
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *prefix =
+        "<think>inspect first</think>visible answer\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read_alpha\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">first";
+    const char *raw =
+        "<think>inspect first</think>visible answer\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read_alpha\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">first-file"
+        DS4_PARAM_END "\n" DS4_INVOKE_END "\n"
+        DS4_INVOKE_START " name=\"write_beta\">\n"
+        DS4_PARAM_START " name=\"values\" string=\"false\">[3,true,null]"
+        DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+    const bool prefix_ok = openai_sse_stream_update(-1, NULL, &r, "native-tools", &st,
+                                                   prefix, strlen(prefix), false);
+    const bool full_ok = openai_sse_stream_update(-1, NULL, &r, "native-tools", &st,
+                                                 raw, strlen(raw), false);
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    const bool parsed = parse_generated_message_ex(raw, true, &content, &reasoning, &calls);
+    apply_openai_stream_tool_ids(&calls, &st);
+    const bool finished = openai_sse_finish_live(-1, NULL, &r, "native-tools", &st,
+                                                raw, strlen(raw), &calls, "tool_calls", 43, 59);
+    TEST_ASSERT(prefix_ok && full_ok && parsed && finished);
+    TEST_ASSERT(!capture.invalid_tool_index);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "visible answer"));
+    TEST_ASSERT(capture.reasoning.ptr && !strcmp(capture.reasoning.ptr, "inspect first"));
+    TEST_ASSERT(capture.reasoning_started == 1 && capture.reasoning_completed == 1);
+    TEST_ASSERT(capture.tool_starts[0] == 1 && capture.tool_starts[1] == 1);
+    TEST_ASSERT(capture.names[0].ptr && !strcmp(capture.names[0].ptr, "read_alpha"));
+    TEST_ASSERT(capture.names[1].ptr && !strcmp(capture.names[1].ptr, "write_beta"));
+    TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr, "{\"path\":\"first-file\"}"));
+    TEST_ASSERT(capture.arguments[1].ptr && !strcmp(capture.arguments[1].ptr, "{\"values\":[3,true,null]}"));
+    TEST_ASSERT(calls.len == 2);
+    TEST_ASSERT(capture.ids[0].ptr && calls.len == 2 && !strcmp(capture.ids[0].ptr, calls.v[0].id));
+    TEST_ASSERT(capture.ids[1].ptr && calls.len == 2 && !strcmp(capture.ids[1].ptr, calls.v[1].id));
+    TEST_ASSERT(capture.ids[0].ptr && capture.ids[1].ptr && strcmp(capture.ids[0].ptr, capture.ids[1].ptr));
+    TEST_ASSERT(capture.finish.ptr && !strcmp(capture.finish.ptr, "tool_calls"));
+    TEST_ASSERT(capture.prompt_tokens == 43 && capture.completion_tokens == 59);
+    TEST_ASSERT(capture.cache_read_tokens == 17 && capture.cache_write_tokens == 26);
+    TEST_ASSERT(capture.done == 1 && capture.kind == DS4_CHAT_DONE);
+    free(content); free(reasoning); tool_calls_free(&calls); openai_stream_free(&st);
+    buf_free(&capture.text); buf_free(&capture.reasoning); buf_free(&capture.finish);
+    for (int i = 0; i < 2; i++) {
+        buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
+    }
     request_free(&r);
 }
 
@@ -23127,6 +23292,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_native_chat_content_preserves_bytes();
+    test_native_chat_streams_tools_and_completion();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
