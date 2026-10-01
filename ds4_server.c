@@ -227,7 +227,7 @@ static bool json_u16(const char **p, uint32_t *out) {
     return true;
 }
 
-static bool json_string(const char **p, char **out) {
+static bool json_string_bytes(const char **p, char **out, size_t *length) {
     /* Always define *out. Every failure path below returns false without
      * producing a string, and several callers reparse in place with
      * `free(x); json_string(&p, &x)` (e.g. duplicate JSON keys, the "model"
@@ -277,11 +277,17 @@ static bool json_string(const char **p, char **out) {
     }
     if (**p != '"') goto fail;
     (*p)++;
+    *length = b.len;
     *out = buf_take(&b);
     return true;
 fail:
     buf_free(&b);
     return false;
+}
+
+static bool json_string(const char **p, char **out) {
+    size_t length;
+    return json_string_bytes(p, out, &length);
 }
 
 static bool json_number(const char **p, double *out) {
@@ -3758,6 +3764,73 @@ bool ds4_chat_add_tool(ds4_chat *chat, const ds4_value *schema) {
     }
     buf_free(&encoded);
     return accepted;
+}
+
+/* Owns only trees decoded from model output; caller-provided trees stay borrowed. */
+static void native_value_free(ds4_value *value) {
+    for (size_t i = 0; i < value->count; i++)
+        native_value_free((ds4_value *)&value->children[i]);
+    free((void *)value->children);
+    free((void *)value->key);
+    free((void *)value->text);
+    memset(value, 0, sizeof(*value));
+}
+
+/* Decodes the model parser's completed argument values inside DwarfStar. */
+static bool native_value_parse(const char **p, ds4_value *value, unsigned depth) {
+    if (depth > 128) return false;
+    json_ws(p);
+    if (**p == '"') {
+        value->kind = DS4_VALUE_STRING;
+        char *text = NULL;
+        if (!json_string_bytes(p, &text, &value->text_length)) return false;
+        value->text = text;
+        return true;
+    }
+    if (**p == '{' || **p == '[') {
+        bool object = **p == '{';
+        const char end = object ? '}' : ']';
+        value->kind = object ? DS4_VALUE_OBJECT : DS4_VALUE_ARRAY;
+        (*p)++;
+        json_ws(p);
+        if (**p == end) { (*p)++; return true; }
+        for (;;) {
+            ds4_value child = {0};
+            if (object) {
+                char *key = NULL;
+                if (!json_string_bytes(p, &key, &child.key_length)) goto bad_child;
+                child.key = key;
+                json_ws(p);
+                if (**p != ':') goto bad_child;
+                (*p)++;
+            }
+            if (!native_value_parse(p, &child, depth + 1)) goto bad_child;
+            ds4_value *children = xrealloc((void *)value->children,
+                (value->count + 1) * sizeof(*children));
+            children[value->count++] = child;
+            value->children = children;
+            json_ws(p);
+            if (**p == end) { (*p)++; return true; }
+            if (**p != ',') return false;
+            (*p)++;
+            continue;
+bad_child:
+            native_value_free(&child);
+            return false;
+        }
+    }
+    if (!strncmp(*p, "null", 4)) { value->kind = DS4_VALUE_NULL; *p += 4; return true; }
+    if (!strncmp(*p, "true", 4)) {
+        value->kind = DS4_VALUE_BOOL; value->boolean = true; *p += 4; return true;
+    }
+    if (!strncmp(*p, "false", 5)) {
+        value->kind = DS4_VALUE_BOOL; value->boolean = false; *p += 5; return true;
+    }
+    value->kind = DS4_VALUE_NUMBER;
+    if (!json_number(p, &value->number)) return false;
+    uint64_t bits;
+    memcpy(&bits, &value->number, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
 
 bool ds4_chat_add_image(ds4_chat *chat, int message, const char *media_type,
@@ -7508,17 +7581,11 @@ static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char 
     return ok;
 }
 
-/* Argument fragments are already in the model parser's native JSON form. */
+/* JSON argument fragments belong to the HTTP projection only. */
 static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char *id,
                                             int index, const char *text, size_t len) {
     if (len == 0) return true;
-    if (r->event_callback) {
-        const ds4_chat_event event = {
-            .kind = DS4_CHAT_TOOL_ARGUMENTS, .tool_index = index,
-            .text = text, .text_length = len,
-        };
-        return r->event_callback(r->event_context, &event);
-    }
+    if (r->event_callback) return true;
     buf b = {0};
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -8392,18 +8459,23 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     if (r->event_callback) {
-        if (calls && calls->len && !st->tool.emitted_any) {
+        if (calls && calls->len) {
             for (int i = 0; i < calls->len; i++) {
                 const tool_call *call = &calls->v[i];
                 char generated_id[128];
                 snprintf(generated_id, sizeof(generated_id), "%s_tool_%d", id, i);
-                if (!sse_chat_tool_call_start_delta(fd, r, id, i,
+                if (!st->tool.emitted_any && !sse_chat_tool_call_start_delta(fd, r, id, i,
                     call->id ? call->id : generated_id, call->name ? call->name : "")) return false;
-                buf arguments = {0};
-                append_json_object_or_empty(&arguments, call->arguments);
-                const bool delivered = sse_chat_tool_call_args_delta_n(
-                    fd, r, id, i, arguments.ptr, arguments.len);
-                buf_free(&arguments);
+                ds4_value arguments = {0};
+                const char *cursor = call->arguments ? call->arguments : "";
+                bool parsed = native_value_parse(&cursor, &arguments, 0);
+                json_ws(&cursor);
+                parsed = parsed && !*cursor && arguments.kind == DS4_VALUE_OBJECT;
+                const ds4_chat_event event = {
+                    .kind = DS4_CHAT_TOOL_ARGUMENTS, .tool_index = i, .value = &arguments,
+                };
+                const bool delivered = parsed && r->event_callback(r->event_context, &event);
+                native_value_free(&arguments);
                 if (!delivered) return false;
             }
         }
@@ -18029,6 +18101,7 @@ typedef struct {
     buf text, reasoning, arguments[2], names[2], ids[2], finish;
     ds4_chat_event_kind kind;
     int count, reasoning_started, reasoning_completed, tool_starts[2], done;
+    int typed_argument_objects;
     int prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens;
     bool invalid_tool_index, stop_after_event;
     int current, total, error_status;
@@ -18056,7 +18129,10 @@ static bool test_capture_native_event(void *context, const ds4_chat_event *event
             buf_puts(&capture->names[event->tool_index], event->tool_name);
             buf_puts(&capture->ids[event->tool_index], event->tool_id);
         } else {
-            buf_append(&capture->arguments[event->tool_index], event->text, event->text_length);
+            if (event->value && event->value->kind == DS4_VALUE_OBJECT) {
+                capture->typed_argument_objects++;
+                native_value_json(&capture->arguments[event->tool_index], event->value, 0);
+            }
         }
         break;
     case DS4_CHAT_FINISH: buf_append(&capture->finish, event->text, event->text_length); break;
@@ -18141,6 +18217,7 @@ static void test_native_chat_streams_tools_and_completion(void) {
     TEST_ASSERT(capture.reasoning.ptr && !strcmp(capture.reasoning.ptr, "inspect first"));
     TEST_ASSERT(capture.reasoning_started == 1 && capture.reasoning_completed == 1);
     TEST_ASSERT(capture.tool_starts[0] == 1 && capture.tool_starts[1] == 1);
+    TEST_ASSERT(capture.typed_argument_objects == 2);
     TEST_ASSERT(capture.names[0].ptr && !strcmp(capture.names[0].ptr, "read_alpha"));
     TEST_ASSERT(capture.names[1].ptr && !strcmp(capture.names[1].ptr, "write_beta"));
     TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr, "{\"path\":\"first-file\"}"));

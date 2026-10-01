@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "ds4_value.h"
 
 /* Semantic output from the native chat pipeline, before HTTP/SSE encoding. */
 typedef enum {
@@ -20,7 +21,7 @@ typedef enum {
 } ds4_chat_event_kind;
 
 /* All strings and bytes are borrowed for the callback's duration. Text length
- * is explicit; tool arguments remain DS4's native JSON fragments. Unused
+ * is explicit; tool arguments are borrowed typed objects. Unused
  * fields are zero. Finish text is the native stop/length/tool_calls/error
  * reason; error text is an actionable diagnostic. */
 typedef struct {
@@ -30,6 +31,7 @@ typedef struct {
     int tool_index;
     const char *tool_id;
     const char *tool_name;
+    const ds4_value *value;
     int prompt_tokens;
     int completion_tokens;
     int cache_read_tokens;
