@@ -1530,6 +1530,7 @@ static void append_raw_json_line(buf *b, const char *json) {
 }
 
 static void json_escape(buf *b, const char *s);
+static void json_escape_n(buf *b, const char *s, size_t n);
 
 static char *openai_function_schema_from_tool(const char *raw) {
     const char *p = raw;
@@ -3687,34 +3688,76 @@ bool ds4_chat_append_text(ds4_chat *chat, int message, const char *text) {
     return true;
 }
 
+/* The embedded boundary accepts values; model rendering owns JSON encoding. */
+static bool native_value_json(buf *out, const ds4_value *value, unsigned depth) {
+    if (!value || depth > 128) return false;
+    switch (value->kind) {
+    case DS4_VALUE_NULL: buf_puts(out, "null"); return true;
+    case DS4_VALUE_BOOL: buf_puts(out, value->boolean ? "true" : "false"); return true;
+    case DS4_VALUE_NUMBER:
+        /* Bit inspection also works in builds using -ffast-math. */
+        {
+            uint64_t bits;
+            memcpy(&bits, &value->number, sizeof(bits));
+            if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000)) return false;
+        }
+        buf_printf(out, "%.17g", value->number);
+        return true;
+    case DS4_VALUE_STRING:
+        if (!value->text && value->text_length) return false;
+        json_escape_n(out, value->text ? value->text : "", value->text_length);
+        return true;
+    case DS4_VALUE_ARRAY:
+    case DS4_VALUE_OBJECT:
+        if (!value->children && value->count) return false;
+        buf_putc(out, value->kind == DS4_VALUE_OBJECT ? '{' : '[');
+        for (size_t i = 0; i < value->count; i++) {
+            const ds4_value *child = &value->children[i];
+            if (i) buf_putc(out, ',');
+            if (value->kind == DS4_VALUE_OBJECT) {
+                if (!child->key && child->key_length) return false;
+                json_escape_n(out, child->key ? child->key : "", child->key_length);
+                buf_putc(out, ':');
+            }
+            if (!native_value_json(out, child, depth + 1)) return false;
+        }
+        buf_putc(out, value->kind == DS4_VALUE_OBJECT ? '}' : ']');
+        return true;
+    }
+    return false;
+}
+
 bool ds4_chat_add_tool_call(ds4_chat *chat, int message, const char *id,
-                           const char *name, const char *arguments) {
+                           const char *name, const ds4_value *arguments) {
     if (!chat || message < 0 || message >= chat->messages.len || !id || !id[0] ||
-        !name || !name[0] || !arguments ||
+        !name || !name[0] || !arguments || arguments->kind != DS4_VALUE_OBJECT ||
         strcmp(chat->messages.v[message].role, "assistant")) return false;
-    const char *p = arguments;
-    json_ws(&p);
-    if (*p != '{' || !json_skip_value(&p)) return false;
-    json_ws(&p);
-    if (*p) return false;
-    tool_call call = {.id = xstrdup(id), .name = xstrdup(name), .arguments = xstrdup(arguments)};
+    buf encoded = {0};
+    if (!native_value_json(&encoded, arguments, 0)) {
+        buf_free(&encoded);
+        return false;
+    }
+    tool_call call = {.id = xstrdup(id), .name = xstrdup(name), .arguments = buf_take(&encoded)};
     tool_calls_push(&chat->messages.v[message].calls, call);
     return true;
 }
 
-bool ds4_chat_add_tool(ds4_chat *chat, const char *schema) {
-    if (!chat || !schema) return false;
-    const char *p = schema;
-    json_ws(&p);
-    if (*p != '{' || !json_skip_value(&p)) return false;
-    json_ws(&p);
-    if (*p) return false;
+bool ds4_chat_add_tool(ds4_chat *chat, const ds4_value *schema) {
+    if (!chat || !schema || schema->kind != DS4_VALUE_OBJECT) return false;
+    buf encoded = {0};
+    if (!native_value_json(&encoded, schema, 0)) {
+        buf_free(&encoded);
+        return false;
+    }
     int before = chat->orders.len;
-    tool_schema_orders_add_json(&chat->orders, schema);
-    if (chat->orders.len != before + 1) return false;
-    if (chat->schemas.len) buf_putc(&chat->schemas, '\n');
-    buf_puts(&chat->schemas, schema);
-    return true;
+    tool_schema_orders_add_json(&chat->orders, encoded.ptr);
+    bool accepted = chat->orders.len == before + 1;
+    if (accepted) {
+        if (chat->schemas.len) buf_putc(&chat->schemas, '\n');
+        buf_append(&chat->schemas, encoded.ptr, encoded.len);
+    }
+    buf_free(&encoded);
+    return accepted;
 }
 
 bool ds4_chat_add_image(ds4_chat *chat, int message, const char *media_type,
@@ -18218,15 +18261,44 @@ static void test_native_chat_renders_history_and_tools(void) {
     int system = ds4_chat_add_message(chat, "system", "native instruction", NULL, NULL);
     int user = ds4_chat_add_message(chat, "user", "quote=\"猫\"\\path\n", NULL, NULL);
     int assistant = ds4_chat_add_message(chat, "assistant", "visible text", "private plan", NULL);
+    const ds4_value arguments[] = {
+        {.key = "path", .key_length = 4, .kind = DS4_VALUE_STRING,
+         .text = "file-alpha", .text_length = 10},
+        {.key = "mode", .key_length = 4, .kind = DS4_VALUE_STRING,
+         .text = "brief", .text_length = 5},
+    };
+    const ds4_value argument_object = {
+        .kind = DS4_VALUE_OBJECT, .children = arguments, .count = 2};
     bool call = ds4_chat_add_tool_call(chat, assistant, "native-call-17", "inspect_file",
-                                      "{\"path\":\"file-alpha\",\"mode\":\"brief\"}");
+                                      &argument_object);
     int tool = ds4_chat_add_message(chat, "tool", "tool result beta", NULL, "native-call-17");
     int next = ds4_chat_add_message(chat, "user", "next question", NULL, NULL);
     bool appended = ds4_chat_append_text(chat, next, " with detail");
-    bool schema = ds4_chat_add_tool(chat,
-        "{\"name\":\"inspect_file\",\"description\":\"Read a file\",\"parameters\":{"
-        "\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\"},"
-        "\"path\":{\"type\":\"string\"}}}}");
+    const ds4_value string_type = {.key = "type", .key_length = 4,
+        .kind = DS4_VALUE_STRING, .text = "string", .text_length = 6};
+    const ds4_value properties[] = {
+        {.key = "mode", .key_length = 4, .kind = DS4_VALUE_OBJECT,
+         .children = &string_type, .count = 1},
+        {.key = "path", .key_length = 4, .kind = DS4_VALUE_OBJECT,
+         .children = &string_type, .count = 1},
+    };
+    const ds4_value parameters[] = {
+        {.key = "type", .key_length = 4, .kind = DS4_VALUE_STRING,
+         .text = "object", .text_length = 6},
+        {.key = "properties", .key_length = 10, .kind = DS4_VALUE_OBJECT,
+         .children = properties, .count = 2},
+    };
+    const ds4_value fields[] = {
+        {.key = "name", .key_length = 4, .kind = DS4_VALUE_STRING,
+         .text = "inspect_file", .text_length = 12},
+        {.key = "description", .key_length = 11, .kind = DS4_VALUE_STRING,
+         .text = "Read a file", .text_length = 11},
+        {.key = "parameters", .key_length = 10, .kind = DS4_VALUE_OBJECT,
+         .children = parameters, .count = 2},
+    };
+    const ds4_value schema_object = {
+        .kind = DS4_VALUE_OBJECT, .children = fields, .count = 3};
+    bool schema = ds4_chat_add_tool(chat, &schema_object);
     char *prompt = ds4_chat_render(chat, NULL, DS4_THINK_HIGH, true);
     TEST_ASSERT(system == 0 && user == 1 && assistant == 2 && tool == 3 && next == 4);
     TEST_ASSERT(call && schema && appended);
