@@ -227,7 +227,7 @@ static bool json_u16(const char **p, uint32_t *out) {
     return true;
 }
 
-static bool json_string(const char **p, char **out) {
+static bool json_string_bytes(const char **p, char **out, size_t *length) {
     /* Always define *out. Every failure path below returns false without
      * producing a string, and several callers reparse in place with
      * `free(x); json_string(&p, &x)` (e.g. duplicate JSON keys, the "model"
@@ -277,11 +277,17 @@ static bool json_string(const char **p, char **out) {
     }
     if (**p != '"') goto fail;
     (*p)++;
+    *length = b.len;
     *out = buf_take(&b);
     return true;
 fail:
     buf_free(&b);
     return false;
+}
+
+static bool json_string(const char **p, char **out) {
+    size_t length;
+    return json_string_bytes(p, out, &length);
 }
 
 static bool json_number(const char **p, double *out) {
@@ -1530,6 +1536,7 @@ static void append_raw_json_line(buf *b, const char *json) {
 }
 
 static void json_escape(buf *b, const char *s);
+static void json_escape_n(buf *b, const char *s, size_t n);
 
 static char *openai_function_schema_from_tool(const char *raw) {
     const char *p = raw;
@@ -3687,34 +3694,143 @@ bool ds4_chat_append_text(ds4_chat *chat, int message, const char *text) {
     return true;
 }
 
+/* The embedded boundary accepts values; model rendering owns JSON encoding. */
+static bool native_value_json(buf *out, const ds4_value *value, unsigned depth) {
+    if (!value || depth > 128) return false;
+    switch (value->kind) {
+    case DS4_VALUE_NULL: buf_puts(out, "null"); return true;
+    case DS4_VALUE_BOOL: buf_puts(out, value->boolean ? "true" : "false"); return true;
+    case DS4_VALUE_NUMBER:
+        /* Bit inspection also works in builds using -ffast-math. */
+        {
+            uint64_t bits;
+            memcpy(&bits, &value->number, sizeof(bits));
+            if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000)) return false;
+        }
+        buf_printf(out, "%.17g", value->number);
+        return true;
+    case DS4_VALUE_STRING:
+        if (!value->text && value->text_length) return false;
+        json_escape_n(out, value->text ? value->text : "", value->text_length);
+        return true;
+    case DS4_VALUE_ARRAY:
+    case DS4_VALUE_OBJECT:
+        if (!value->children && value->count) return false;
+        buf_putc(out, value->kind == DS4_VALUE_OBJECT ? '{' : '[');
+        for (size_t i = 0; i < value->count; i++) {
+            const ds4_value *child = &value->children[i];
+            if (i) buf_putc(out, ',');
+            if (value->kind == DS4_VALUE_OBJECT) {
+                if (!child->key && child->key_length) return false;
+                json_escape_n(out, child->key ? child->key : "", child->key_length);
+                buf_putc(out, ':');
+            }
+            if (!native_value_json(out, child, depth + 1)) return false;
+        }
+        buf_putc(out, value->kind == DS4_VALUE_OBJECT ? '}' : ']');
+        return true;
+    }
+    return false;
+}
+
 bool ds4_chat_add_tool_call(ds4_chat *chat, int message, const char *id,
-                           const char *name, const char *arguments) {
+                           const char *name, const ds4_value *arguments) {
     if (!chat || message < 0 || message >= chat->messages.len || !id || !id[0] ||
-        !name || !name[0] || !arguments ||
+        !name || !name[0] || !arguments || arguments->kind != DS4_VALUE_OBJECT ||
         strcmp(chat->messages.v[message].role, "assistant")) return false;
-    const char *p = arguments;
-    json_ws(&p);
-    if (*p != '{' || !json_skip_value(&p)) return false;
-    json_ws(&p);
-    if (*p) return false;
-    tool_call call = {.id = xstrdup(id), .name = xstrdup(name), .arguments = xstrdup(arguments)};
+    buf encoded = {0};
+    if (!native_value_json(&encoded, arguments, 0)) {
+        buf_free(&encoded);
+        return false;
+    }
+    tool_call call = {.id = xstrdup(id), .name = xstrdup(name), .arguments = buf_take(&encoded)};
     tool_calls_push(&chat->messages.v[message].calls, call);
     return true;
 }
 
-bool ds4_chat_add_tool(ds4_chat *chat, const char *schema) {
-    if (!chat || !schema) return false;
-    const char *p = schema;
-    json_ws(&p);
-    if (*p != '{' || !json_skip_value(&p)) return false;
-    json_ws(&p);
-    if (*p) return false;
+bool ds4_chat_add_tool(ds4_chat *chat, const ds4_value *schema) {
+    if (!chat || !schema || schema->kind != DS4_VALUE_OBJECT) return false;
+    buf encoded = {0};
+    if (!native_value_json(&encoded, schema, 0)) {
+        buf_free(&encoded);
+        return false;
+    }
     int before = chat->orders.len;
-    tool_schema_orders_add_json(&chat->orders, schema);
-    if (chat->orders.len != before + 1) return false;
-    if (chat->schemas.len) buf_putc(&chat->schemas, '\n');
-    buf_puts(&chat->schemas, schema);
-    return true;
+    tool_schema_orders_add_json(&chat->orders, encoded.ptr);
+    bool accepted = chat->orders.len == before + 1;
+    if (accepted) {
+        if (chat->schemas.len) buf_putc(&chat->schemas, '\n');
+        buf_append(&chat->schemas, encoded.ptr, encoded.len);
+    }
+    buf_free(&encoded);
+    return accepted;
+}
+
+/* Owns only trees decoded from model output; caller-provided trees stay borrowed. */
+static void native_value_free(ds4_value *value) {
+    for (size_t i = 0; i < value->count; i++)
+        native_value_free((ds4_value *)&value->children[i]);
+    free((void *)value->children);
+    free((void *)value->key);
+    free((void *)value->text);
+    memset(value, 0, sizeof(*value));
+}
+
+/* Decodes the model parser's completed argument values inside DwarfStar. */
+static bool native_value_parse(const char **p, ds4_value *value, unsigned depth) {
+    if (depth > 128) return false;
+    json_ws(p);
+    if (**p == '"') {
+        value->kind = DS4_VALUE_STRING;
+        char *text = NULL;
+        if (!json_string_bytes(p, &text, &value->text_length)) return false;
+        value->text = text;
+        return true;
+    }
+    if (**p == '{' || **p == '[') {
+        bool object = **p == '{';
+        const char end = object ? '}' : ']';
+        value->kind = object ? DS4_VALUE_OBJECT : DS4_VALUE_ARRAY;
+        (*p)++;
+        json_ws(p);
+        if (**p == end) { (*p)++; return true; }
+        for (;;) {
+            ds4_value child = {0};
+            if (object) {
+                char *key = NULL;
+                if (!json_string_bytes(p, &key, &child.key_length)) goto bad_child;
+                child.key = key;
+                json_ws(p);
+                if (**p != ':') goto bad_child;
+                (*p)++;
+            }
+            if (!native_value_parse(p, &child, depth + 1)) goto bad_child;
+            ds4_value *children = xrealloc((void *)value->children,
+                (value->count + 1) * sizeof(*children));
+            children[value->count++] = child;
+            value->children = children;
+            json_ws(p);
+            if (**p == end) { (*p)++; return true; }
+            if (**p != ',') return false;
+            (*p)++;
+            continue;
+bad_child:
+            native_value_free(&child);
+            return false;
+        }
+    }
+    if (!strncmp(*p, "null", 4)) { value->kind = DS4_VALUE_NULL; *p += 4; return true; }
+    if (!strncmp(*p, "true", 4)) {
+        value->kind = DS4_VALUE_BOOL; value->boolean = true; *p += 4; return true;
+    }
+    if (!strncmp(*p, "false", 5)) {
+        value->kind = DS4_VALUE_BOOL; value->boolean = false; *p += 5; return true;
+    }
+    value->kind = DS4_VALUE_NUMBER;
+    if (!json_number(p, &value->number)) return false;
+    uint64_t bits;
+    memcpy(&bits, &value->number, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
 
 bool ds4_chat_add_image(ds4_chat *chat, int message, const char *media_type,
@@ -7327,6 +7443,8 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    char *native_param_name;
+    buf native_param_value;
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -7359,6 +7477,9 @@ static void openai_tool_stream_free(openai_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
+    free(ts->native_param_name);
+    ts->native_param_name = NULL;
+    buf_free(&ts->native_param_value);
     ts->ids = NULL;
     ts->ids_cap = 0;
 }
@@ -7465,17 +7586,11 @@ static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char 
     return ok;
 }
 
-/* Argument fragments are already in the model parser's native JSON form. */
+/* JSON argument fragments belong to the HTTP projection only. */
 static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char *id,
                                             int index, const char *text, size_t len) {
     if (len == 0) return true;
-    if (r->event_callback) {
-        const ds4_chat_event event = {
-            .kind = DS4_CHAT_TOOL_ARGUMENTS, .tool_index = index,
-            .text = text, .text_length = len,
-        };
-        return r->event_callback(r->event_context, &event);
-    }
+    if (r->event_callback) return true;
     buf b = {0};
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -7969,6 +8084,11 @@ static size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
 static bool openai_tool_emit_args_fragment(int fd, const request *r, const char *id,
                                            openai_tool_stream *ts,
                                            const char *text, size_t len) {
+    if (r->event_callback) {
+        if (ts->state == DSML_TOOL_PARAM_VALUE && !ts->param_is_string)
+            buf_append(&ts->native_param_value, text, len);
+        return true;
+    }
     return sse_chat_tool_call_args_delta_n(fd, r, id, ts->index, text, len);
 }
 
@@ -7978,6 +8098,20 @@ static bool openai_tool_emit_string_value(int fd, const request *r, const char *
     if (len == 0) return true;
     char *raw = xstrndup(text, len);
     ds4_tool_text_unescape(raw, ts->param_end);
+    if (r->event_callback) {
+        const ds4_value value = {
+            .kind = DS4_VALUE_STRING, .key = ts->native_param_name,
+            .key_length = strlen(ts->native_param_name),
+            .text = raw, .text_length = strlen(raw),
+        };
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_TOOL_ARGUMENT_TEXT, .tool_index = ts->index, .value = &value,
+        };
+        buf_append(&ts->native_param_value, raw, value.text_length);
+        bool ok = r->event_callback(r->event_context, &event);
+        free(raw);
+        return ok;
+    }
     buf frag = {0};
     json_escape_fragment_n(&frag, raw, strlen(raw));
     bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
@@ -7989,6 +8123,12 @@ static bool openai_tool_emit_string_value(int fd, const request *r, const char *
 static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *id,
                                           openai_tool_stream *ts,
                                           const char *name, bool is_string) {
+    if (r->event_callback) {
+        free(ts->native_param_name);
+        ts->native_param_name = xstrdup(name);
+        buf_free(&ts->native_param_value);
+        return true;
+    }
     buf frag = {0};
     if (ts->first_param) ts->first_param = false;
     else buf_putc(&frag, ',');
@@ -8112,6 +8252,32 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     }
     if (ts->param_is_string &&
         !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
+    if (r->event_callback) {
+        ds4_value value = {0};
+        bool parsed;
+        if (ts->param_is_string) {
+            value.kind = DS4_VALUE_STRING;
+            value.text = xstrndup(ts->native_param_value.ptr ? ts->native_param_value.ptr : "",
+                                  ts->native_param_value.len);
+            value.text_length = ts->native_param_value.len;
+            parsed = true;
+        } else {
+            const char *cursor = ts->native_param_value.ptr ? ts->native_param_value.ptr : "";
+            parsed = native_value_parse(&cursor, &value, 0);
+            json_ws(&cursor);
+            parsed = parsed && !*cursor;
+        }
+        /* Final parsing owns recovery of malformed model output. Only publish
+         * complete, valid values here; the final object remains authoritative. */
+        value.key = xstrdup(ts->native_param_name);
+        value.key_length = strlen(ts->native_param_name);
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_TOOL_ARGUMENT, .tool_index = ts->index, .value = &value,
+        };
+        bool ok = !parsed || r->event_callback(r->event_context, &event);
+        native_value_free(&value);
+        if (!ok) return false;
+    }
     ts->parse_pos = value_end + strlen(ts->param_end);
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
@@ -8349,18 +8515,23 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     if (r->event_callback) {
-        if (calls && calls->len && !st->tool.emitted_any) {
+        if (calls && calls->len) {
             for (int i = 0; i < calls->len; i++) {
                 const tool_call *call = &calls->v[i];
                 char generated_id[128];
                 snprintf(generated_id, sizeof(generated_id), "%s_tool_%d", id, i);
-                if (!sse_chat_tool_call_start_delta(fd, r, id, i,
+                if (!st->tool.emitted_any && !sse_chat_tool_call_start_delta(fd, r, id, i,
                     call->id ? call->id : generated_id, call->name ? call->name : "")) return false;
-                buf arguments = {0};
-                append_json_object_or_empty(&arguments, call->arguments);
-                const bool delivered = sse_chat_tool_call_args_delta_n(
-                    fd, r, id, i, arguments.ptr, arguments.len);
-                buf_free(&arguments);
+                ds4_value arguments = {0};
+                const char *cursor = call->arguments ? call->arguments : "";
+                bool parsed = native_value_parse(&cursor, &arguments, 0);
+                json_ws(&cursor);
+                parsed = parsed && !*cursor && arguments.kind == DS4_VALUE_OBJECT;
+                const ds4_chat_event event = {
+                    .kind = DS4_CHAT_TOOL_ARGUMENTS, .tool_index = i, .value = &arguments,
+                };
+                const bool delivered = parsed && r->event_callback(r->event_context, &event);
+                native_value_free(&arguments);
                 if (!delivered) return false;
             }
         }
@@ -17986,6 +18157,8 @@ typedef struct {
     buf text, reasoning, arguments[2], names[2], ids[2], finish;
     ds4_chat_event_kind kind;
     int count, reasoning_started, reasoning_completed, tool_starts[2], done;
+    int typed_argument_objects;
+    buf argument_text;
     int prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens;
     bool invalid_tool_index, stop_after_event;
     int current, total, error_status;
@@ -18002,6 +18175,10 @@ static bool test_capture_native_event(void *context, const ds4_chat_event *event
         buf_append(&capture->reasoning, event->text, event->text_length); break;
     case DS4_CHAT_REASONING_STARTED: capture->reasoning_started++; break;
     case DS4_CHAT_REASONING_COMPLETED: capture->reasoning_completed++; break;
+    case DS4_CHAT_TOOL_ARGUMENT_TEXT:
+        if (event->value && event->value->kind == DS4_VALUE_STRING)
+            buf_append(&capture->argument_text, event->value->text, event->value->text_length);
+        break;
     case DS4_CHAT_TOOL_START:
     case DS4_CHAT_TOOL_ARGUMENTS:
         if (event->tool_index < 0 || event->tool_index >= 2) {
@@ -18013,7 +18190,10 @@ static bool test_capture_native_event(void *context, const ds4_chat_event *event
             buf_puts(&capture->names[event->tool_index], event->tool_name);
             buf_puts(&capture->ids[event->tool_index], event->tool_id);
         } else {
-            buf_append(&capture->arguments[event->tool_index], event->text, event->text_length);
+            if (event->value && event->value->kind == DS4_VALUE_OBJECT) {
+                capture->typed_argument_objects++;
+                native_value_json(&capture->arguments[event->tool_index], event->value, 0);
+            }
         }
         break;
     case DS4_CHAT_FINISH: buf_append(&capture->finish, event->text, event->text_length); break;
@@ -18084,6 +18264,7 @@ static void test_native_chat_streams_tools_and_completion(void) {
         DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
     const bool prefix_ok = openai_sse_stream_update(-1, NULL, &r, "native-tools", &st,
                                                    prefix, strlen(prefix), false);
+    TEST_ASSERT(capture.argument_text.ptr && !strcmp(capture.argument_text.ptr, "first"));
     const bool full_ok = openai_sse_stream_update(-1, NULL, &r, "native-tools", &st,
                                                  raw, strlen(raw), false);
     char *content = NULL, *reasoning = NULL;
@@ -18098,6 +18279,7 @@ static void test_native_chat_streams_tools_and_completion(void) {
     TEST_ASSERT(capture.reasoning.ptr && !strcmp(capture.reasoning.ptr, "inspect first"));
     TEST_ASSERT(capture.reasoning_started == 1 && capture.reasoning_completed == 1);
     TEST_ASSERT(capture.tool_starts[0] == 1 && capture.tool_starts[1] == 1);
+    TEST_ASSERT(capture.typed_argument_objects == 2);
     TEST_ASSERT(capture.names[0].ptr && !strcmp(capture.names[0].ptr, "read_alpha"));
     TEST_ASSERT(capture.names[1].ptr && !strcmp(capture.names[1].ptr, "write_beta"));
     TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr, "{\"path\":\"first-file\"}"));
@@ -18112,6 +18294,7 @@ static void test_native_chat_streams_tools_and_completion(void) {
     TEST_ASSERT(capture.done == 1 && capture.kind == DS4_CHAT_DONE);
     free(content); free(reasoning); tool_calls_free(&calls); openai_stream_free(&st);
     buf_free(&capture.text); buf_free(&capture.reasoning); buf_free(&capture.finish);
+    buf_free(&capture.argument_text);
     for (int i = 0; i < 2; i++) {
         buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
     }
@@ -18175,6 +18358,7 @@ static void test_native_stream_model_syntax_and_utf8_boundaries(void) {
             TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr, "{\"command\":\"cat 🐈\"}"));
             TEST_ASSERT(capture.done == 1 && !capture.invalid_tool_index);
             buf_free(&capture.text); buf_free(&capture.reasoning); buf_free(&capture.finish);
+            buf_free(&capture.argument_text);
             for (int i = 0; i < 2; i++) {
                 buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
             }
@@ -18183,6 +18367,52 @@ static void test_native_stream_model_syntax_and_utf8_boundaries(void) {
         }
         buf_free(&raw);
     }
+}
+
+/* Typed values retain all JSON data kinds without a JSON boundary. These
+ * assertions document existing rendering and parsing behavior for the new API. */
+static void test_native_typed_tool_values_round_trip(void) {
+    const ds4_value items[] = {
+        {.kind = DS4_VALUE_NULL},
+        {.kind = DS4_VALUE_BOOL, .boolean = false},
+        {.kind = DS4_VALUE_NUMBER, .number = -2.75},
+        {.kind = DS4_VALUE_OBJECT},
+        {.kind = DS4_VALUE_ARRAY},
+    };
+    const char text[] = "quote=\"猫\"\\path\n";
+    const ds4_value fields[] = {
+        {.kind = DS4_VALUE_STRING, .key = "text", .key_length = 4,
+         .text = text, .text_length = sizeof(text) - 1},
+        {.kind = DS4_VALUE_ARRAY, .key = "items", .key_length = 5,
+         .children = items, .count = 5},
+    };
+    const ds4_value object = {.kind = DS4_VALUE_OBJECT, .children = fields, .count = 2};
+    ds4_chat *chat = ds4_chat_create();
+    int message = ds4_chat_add_message(chat, "assistant", "", NULL, NULL);
+    bool accepted = ds4_chat_add_tool_call(chat, message, "typed-call-29", "inspect_values", &object);
+    request r;
+    request_init(&r, REQ_CHAT, 137);
+    r.think_mode = DS4_THINK_NONE;
+    r.stream_include_usage = true;
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    openai_stream stream;
+    openai_stream_start(&r, &stream);
+    bool finished = openai_sse_finish_live(-1, NULL, &r, "typed", &stream, "", 0,
+        &chat->messages.v[message].calls, "tool_calls", 37, 11);
+    TEST_ASSERT(accepted && finished);
+    TEST_ASSERT(capture.typed_argument_objects == 1);
+    TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr,
+        "{\"text\":\"quote=\\\"猫\\\"\\\\path\\n\",\"items\":[null,false,-2.75,{},[]]}"));
+    TEST_ASSERT(capture.ids[0].ptr && !strcmp(capture.ids[0].ptr, "typed-call-29"));
+    TEST_ASSERT(capture.names[0].ptr && !strcmp(capture.names[0].ptr, "inspect_values"));
+    TEST_ASSERT(capture.done == 1);
+    buf_free(&capture.arguments[0]); buf_free(&capture.names[0]); buf_free(&capture.ids[0]);
+    buf_free(&capture.finish);
+    openai_stream_free(&stream);
+    request_free(&r);
+    ds4_chat_free(chat);
 }
 
 static void test_native_chat_copies_images_in_message_order(void) {
@@ -18218,15 +18448,44 @@ static void test_native_chat_renders_history_and_tools(void) {
     int system = ds4_chat_add_message(chat, "system", "native instruction", NULL, NULL);
     int user = ds4_chat_add_message(chat, "user", "quote=\"猫\"\\path\n", NULL, NULL);
     int assistant = ds4_chat_add_message(chat, "assistant", "visible text", "private plan", NULL);
+    const ds4_value arguments[] = {
+        {.key = "path", .key_length = 4, .kind = DS4_VALUE_STRING,
+         .text = "file-alpha", .text_length = 10},
+        {.key = "mode", .key_length = 4, .kind = DS4_VALUE_STRING,
+         .text = "brief", .text_length = 5},
+    };
+    const ds4_value argument_object = {
+        .kind = DS4_VALUE_OBJECT, .children = arguments, .count = 2};
     bool call = ds4_chat_add_tool_call(chat, assistant, "native-call-17", "inspect_file",
-                                      "{\"path\":\"file-alpha\",\"mode\":\"brief\"}");
+                                      &argument_object);
     int tool = ds4_chat_add_message(chat, "tool", "tool result beta", NULL, "native-call-17");
     int next = ds4_chat_add_message(chat, "user", "next question", NULL, NULL);
     bool appended = ds4_chat_append_text(chat, next, " with detail");
-    bool schema = ds4_chat_add_tool(chat,
-        "{\"name\":\"inspect_file\",\"description\":\"Read a file\",\"parameters\":{"
-        "\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\"},"
-        "\"path\":{\"type\":\"string\"}}}}");
+    const ds4_value string_type = {.key = "type", .key_length = 4,
+        .kind = DS4_VALUE_STRING, .text = "string", .text_length = 6};
+    const ds4_value properties[] = {
+        {.key = "mode", .key_length = 4, .kind = DS4_VALUE_OBJECT,
+         .children = &string_type, .count = 1},
+        {.key = "path", .key_length = 4, .kind = DS4_VALUE_OBJECT,
+         .children = &string_type, .count = 1},
+    };
+    const ds4_value parameters[] = {
+        {.key = "type", .key_length = 4, .kind = DS4_VALUE_STRING,
+         .text = "object", .text_length = 6},
+        {.key = "properties", .key_length = 10, .kind = DS4_VALUE_OBJECT,
+         .children = properties, .count = 2},
+    };
+    const ds4_value fields[] = {
+        {.key = "name", .key_length = 4, .kind = DS4_VALUE_STRING,
+         .text = "inspect_file", .text_length = 12},
+        {.key = "description", .key_length = 11, .kind = DS4_VALUE_STRING,
+         .text = "Read a file", .text_length = 11},
+        {.key = "parameters", .key_length = 10, .kind = DS4_VALUE_OBJECT,
+         .children = parameters, .count = 2},
+    };
+    const ds4_value schema_object = {
+        .kind = DS4_VALUE_OBJECT, .children = fields, .count = 3};
+    bool schema = ds4_chat_add_tool(chat, &schema_object);
     char *prompt = ds4_chat_render(chat, NULL, DS4_THINK_HIGH, true);
     TEST_ASSERT(system == 0 && user == 1 && assistant == 2 && tool == 3 && next == 4);
     TEST_ASSERT(call && schema && appended);
@@ -23643,6 +23902,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_chat_renders_history_and_tools();
     test_native_chat_copies_images_in_message_order();
     test_native_stream_model_syntax_and_utf8_boundaries();
+    test_native_typed_tool_values_round_trip();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
