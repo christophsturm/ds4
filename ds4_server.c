@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_events.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -856,6 +857,8 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    ds4_chat_event_callback event_callback;
+    void *event_context;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -7252,9 +7255,21 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
 
+/* Embedded consumers receive the stream parser's exact bytes before encoding. */
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
     if (len == 0) return true;
+    if (r->event_callback) {
+        ds4_chat_event event = {.text = text, .text_length = len};
+        if (!strcmp(field, "content")) event.kind = DS4_CHAT_CONTENT;
+        else if (!strcmp(field, "reasoning_content")) event.kind = DS4_CHAT_REASONING;
+        else if (!strcmp(field, "reasoning_block") && len == 7 &&
+                 !memcmp(text, "started", 7)) event.kind = DS4_CHAT_REASONING_STARTED;
+        else if (!strcmp(field, "reasoning_block") && len == 9 &&
+                 !memcmp(text, "completed", 9)) event.kind = DS4_CHAT_REASONING_COMPLETED;
+        else return false;
+        return r->event_callback(r->event_context, &event);
+    }
     buf b = {0};
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -17761,6 +17776,39 @@ static void test_openai_thinking_boundaries_preserve_text(void) {
     }
 }
 
+/* Records native bytes without any HTTP or JSON decoder in the test. */
+typedef struct {
+    buf text;
+    ds4_chat_event_kind kind;
+    int count;
+} test_native_event_capture;
+
+static bool test_capture_native_event(void *context, const ds4_chat_event *event) {
+    test_native_event_capture *capture = context;
+    capture->kind = event->kind;
+    capture->count++;
+    if (event->text) buf_append(&capture->text, event->text, event->text_length);
+    return true;
+}
+
+static void test_native_chat_content_preserves_bytes(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 73);
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    const char content[] = "  quote=\"hello\"\n猫\\path\t";
+    const bool delivered = sse_chat_delta_n(-1, &r, "native-content",
+                                           "content", content, sizeof(content) - 1);
+    TEST_ASSERT(delivered);
+    TEST_ASSERT(capture.count == 1);
+    TEST_ASSERT(capture.kind == DS4_CHAT_CONTENT);
+    TEST_ASSERT(capture.text.len == sizeof(content) - 1);
+    TEST_ASSERT(capture.text.ptr && !memcmp(capture.text.ptr, content, sizeof(content) - 1));
+    buf_free(&capture.text);
+    request_free(&r);
+}
+
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -23078,6 +23126,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_stream_split_reasoning_close();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
+    test_native_chat_content_preserves_bytes();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
