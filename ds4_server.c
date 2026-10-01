@@ -18369,6 +18369,52 @@ static void test_native_stream_model_syntax_and_utf8_boundaries(void) {
     }
 }
 
+/* Typed values retain all JSON data kinds without a JSON boundary. These
+ * assertions document existing rendering and parsing behavior for the new API. */
+static void test_native_typed_tool_values_round_trip(void) {
+    const ds4_value items[] = {
+        {.kind = DS4_VALUE_NULL},
+        {.kind = DS4_VALUE_BOOL, .boolean = false},
+        {.kind = DS4_VALUE_NUMBER, .number = -2.75},
+        {.kind = DS4_VALUE_OBJECT},
+        {.kind = DS4_VALUE_ARRAY},
+    };
+    const char text[] = "quote=\"猫\"\\path\n";
+    const ds4_value fields[] = {
+        {.kind = DS4_VALUE_STRING, .key = "text", .key_length = 4,
+         .text = text, .text_length = sizeof(text) - 1},
+        {.kind = DS4_VALUE_ARRAY, .key = "items", .key_length = 5,
+         .children = items, .count = 5},
+    };
+    const ds4_value object = {.kind = DS4_VALUE_OBJECT, .children = fields, .count = 2};
+    ds4_chat *chat = ds4_chat_create();
+    int message = ds4_chat_add_message(chat, "assistant", "", NULL, NULL);
+    bool accepted = ds4_chat_add_tool_call(chat, message, "typed-call-29", "inspect_values", &object);
+    request r;
+    request_init(&r, REQ_CHAT, 137);
+    r.think_mode = DS4_THINK_NONE;
+    r.stream_include_usage = true;
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    openai_stream stream;
+    openai_stream_start(&r, &stream);
+    bool finished = openai_sse_finish_live(-1, NULL, &r, "typed", &stream, "", 0,
+        &chat->messages.v[message].calls, "tool_calls", 37, 11);
+    TEST_ASSERT(accepted && finished);
+    TEST_ASSERT(capture.typed_argument_objects == 1);
+    TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr,
+        "{\"text\":\"quote=\\\"猫\\\"\\\\path\\n\",\"items\":[null,false,-2.75,{},[]]}"));
+    TEST_ASSERT(capture.ids[0].ptr && !strcmp(capture.ids[0].ptr, "typed-call-29"));
+    TEST_ASSERT(capture.names[0].ptr && !strcmp(capture.names[0].ptr, "inspect_values"));
+    TEST_ASSERT(capture.done == 1);
+    buf_free(&capture.arguments[0]); buf_free(&capture.names[0]); buf_free(&capture.ids[0]);
+    buf_free(&capture.finish);
+    openai_stream_free(&stream);
+    request_free(&r);
+    ds4_chat_free(chat);
+}
+
 static void test_native_chat_copies_images_in_message_order(void) {
     ds4_chat *chat = ds4_chat_create();
     int user = ds4_chat_add_message(chat, "user", "before ", NULL, NULL);
@@ -23856,6 +23902,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_chat_renders_history_and_tools();
     test_native_chat_copies_images_in_message_order();
     test_native_stream_model_syntax_and_utf8_boundaries();
+    test_native_typed_tool_values_round_trip();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
