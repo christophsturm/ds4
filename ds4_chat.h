@@ -24,6 +24,9 @@ bool ds4_chat_add_tool_call(ds4_chat *chat, int message, const char *id,
 /* Adds a function schema in the JSON form consumed by the model template,
  * without the HTTP tools/type/function envelope. */
 bool ds4_chat_add_tool(ds4_chat *chat, const char *schema);
+/* Appends PNG/JPEG bytes at the current end of a user message. */
+bool ds4_chat_add_image(ds4_chat *chat, int message, const char *media_type,
+                       const uint8_t *bytes, size_t length);
 /* Renders the same model-specific prompt used for generation. The caller frees
  * the returned string. A NULL engine selects DeepSeek V4 syntax. */
 char *ds4_chat_render(const ds4_chat *chat, ds4_engine *engine,

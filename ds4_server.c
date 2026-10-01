@@ -503,14 +503,10 @@ static bool server_image_media_type(const char *media_type) {
             !strcasecmp(media_type, "image/jpg"));
 }
 
-static bool server_image_inputs_push_base64(server_image_inputs *images,
-                                            const char *media_type,
-                                            const char *base64,
-                                            char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    if (!server_image_media_type(media_type)) return false;
-    server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
-        return false;
+/* Takes ownership of decoded bytes and inserts the model's opaque image marker. */
+static bool server_image_inputs_push_owned(server_image_inputs *images,
+                                           server_image_input image,
+                                           char marker[SERVER_IMAGE_MARKER_BYTES]) {
     unsigned char nonce[12];
     if (!random_bytes(nonce, sizeof(nonce))) {
         uint64_t fallback = (uint64_t)time(NULL) ^
@@ -536,6 +532,16 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
     images->v[images->len++] = image;
     snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", image.marker);
     return true;
+}
+
+static bool server_image_inputs_push_base64(server_image_inputs *images,
+                                            const char *media_type,
+                                            const char *base64,
+                                            char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    if (!server_image_media_type(media_type)) return false;
+    server_image_input image = {0};
+    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len)) return false;
+    return server_image_inputs_push_owned(images, image, marker);
 }
 
 static bool server_image_inputs_push_data_uri(
@@ -3708,6 +3714,24 @@ bool ds4_chat_add_tool(ds4_chat *chat, const char *schema) {
     if (chat->orders.len != before + 1) return false;
     if (chat->schemas.len) buf_putc(&chat->schemas, '\n');
     buf_puts(&chat->schemas, schema);
+    return true;
+}
+
+bool ds4_chat_add_image(ds4_chat *chat, int message, const char *media_type,
+                       const uint8_t *bytes, size_t length) {
+    if (!chat || message < 0 || message >= chat->messages.len || !bytes ||
+        !length || length > 48u * 1024u * 1024u || !server_image_media_type(media_type))
+        return false;
+    chat_msg *msg = &chat->messages.v[message];
+    if (strcmp(msg->role, "user")) return false;
+    size_t image_count = 0;
+    for (int i = 0; i < chat->messages.len; i++) image_count += chat->messages.v[i].images.len;
+    if (image_count >= 16) return false;
+    server_image_input image = {.encoded = xmalloc(length), .encoded_len = length};
+    memcpy(image.encoded, bytes, length);
+    char marker[SERVER_IMAGE_MARKER_BYTES];
+    server_image_inputs_push_owned(&msg->images, image, marker);
+    append_owned_text(&msg->content, marker);
     return true;
 }
 
@@ -18090,6 +18114,34 @@ static void test_native_chat_streams_tools_and_completion(void) {
     request_free(&r);
 }
 
+static void test_native_chat_copies_images_in_message_order(void) {
+    ds4_chat *chat = ds4_chat_create();
+    int user = ds4_chat_add_message(chat, "user", "before ", NULL, NULL);
+    uint8_t png[] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+    const uint8_t jpeg[] = {0xff, 0xd8, 0xff, 0xe0};
+    bool first = ds4_chat_add_image(chat, user, "image/png", png, sizeof(png));
+    bool middle = ds4_chat_append_text(chat, user, " middle ");
+    bool second = ds4_chat_add_image(chat, user, "image/jpeg", jpeg, sizeof(jpeg));
+    bool end = ds4_chat_append_text(chat, user, " after");
+    png[0] = 0;
+    TEST_ASSERT(first && middle && second && end);
+    TEST_ASSERT(chat->messages.v[user].images.len == 2);
+    bool bytes_equal = false, ordered = false, distinct = false;
+    if (chat->messages.v[user].images.len == 2) {
+        const server_image_input *a = &chat->messages.v[user].images.v[0];
+        const server_image_input *b = &chat->messages.v[user].images.v[1];
+        bytes_equal = a->encoded_len == 8 && !memcmp(a->encoded, "\x89PNG\r\n\x1a\n", 8) &&
+                      b->encoded_len == 4 && !memcmp(b->encoded, jpeg, 4);
+        buf expected = {0};
+        buf_printf(&expected, "before %s middle %s after", a->marker, b->marker);
+        ordered = !strcmp(chat->messages.v[user].content, expected.ptr);
+        distinct = strcmp(a->marker, b->marker) != 0;
+        buf_free(&expected);
+    }
+    TEST_ASSERT(bytes_equal && ordered && distinct);
+    ds4_chat_free(chat);
+}
+
 static void test_native_chat_renders_history_and_tools(void) {
     ds4_chat *chat = ds4_chat_create();
     int system = ds4_chat_add_message(chat, "system", "native instruction", NULL, NULL);
@@ -23518,6 +23570,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_stream_does_not_require_socket_headers();
     test_native_context_error_preserves_token_counts();
     test_native_chat_renders_history_and_tools();
+    test_native_chat_copies_images_in_message_order();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
