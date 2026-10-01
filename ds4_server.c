@@ -6992,7 +6992,8 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
-static bool sse_headers(int fd, bool enable_cors) {
+static bool sse_headers(int fd, bool enable_cors, const request *r) {
+    if (r && r->event_callback) return true;
     buf h = {0};
     buf_puts(&h,
         "HTTP/1.1 200 OK\r\n"
@@ -12810,7 +12811,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (p->stream && p->fd >= 0 && !p->stream_failed) {
         if (!p->headers_sent) {
             p->headers_sent = true;
-            if (sse_headers(p->fd, p->enable_cors)) {
+            if (sse_headers(p->fd, p->enable_cors, p->request_job ? &p->request_job->req : NULL)) {
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
@@ -13976,7 +13977,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         /* The prefill progress callback may have already sent the SSE headers
          * to keep the connection alive during a long prefill. Only emit them
          * here when prefill never fired (e.g. fully cached prompt). */
-        if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
+        if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors, &j->req)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
@@ -17312,7 +17313,7 @@ static void test_cors_sse_headers(void) {
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
 
-    TEST_ASSERT(sse_headers(sv[0], true));
+    TEST_ASSERT(sse_headers(sv[0], true, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
     TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
@@ -18005,6 +18006,17 @@ static void test_native_chat_streams_tools_and_completion(void) {
     for (int i = 0; i < 2; i++) {
         buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
     }
+    request_free(&r);
+}
+
+static void test_native_stream_does_not_require_socket_headers(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 101);
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    TEST_ASSERT(sse_headers(-1, false, &r));
+    TEST_ASSERT(capture.count == 0);
     request_free(&r);
 }
 
@@ -23378,6 +23390,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_chat_streams_tools_and_completion();
     test_native_prefill_callback_cancels_generation();
     test_native_prefill_errors_preserve_diagnostics();
+    test_native_stream_does_not_require_socket_headers();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
