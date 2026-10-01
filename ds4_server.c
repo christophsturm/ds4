@@ -3673,7 +3673,7 @@ int ds4_chat_add_message(ds4_chat *chat, const char *role, const char *content,
                          const char *reasoning, const char *tool_call_id) {
     if (!chat || !role || !content) return -1;
     if (strcmp(role, "system") && strcmp(role, "developer") && strcmp(role, "user") &&
-        strcmp(role, "assistant") && strcmp(role, "tool")) return -1;
+        strcmp(role, "assistant") && strcmp(role, "tool") && strcmp(role, "function")) return -1;
     chat_msg msg = {.role = xstrdup(role), .content = xstrdup(content),
                     .reasoning = reasoning ? xstrdup(reasoning) : NULL};
     if (tool_call_id) chat_msg_add_tool_call_id(&msg, tool_call_id);
@@ -4197,6 +4197,17 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+/* Both native and HTTP histories restore exact tool replay before rendering. */
+static void prepare_chat_prompt(server *s, request *r, chat_msgs *msgs,
+                                 const char *tool_schemas) {
+    kv_cache_restore_tool_memory_for_messages(s, msgs);
+    tool_memory_attach_to_messages(s, msgs, &r->tool_replay);
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    r->prompt_preserves_reasoning = chat_history_uses_tool_context(msgs, active_tool_schemas);
+    r->prompt_text = render_chat_prompt_text_for_syntax(
+        r->model_syntax, msgs, active_tool_schemas, &r->tool_orders, r->think_mode);
+}
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -4369,14 +4380,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    kv_cache_restore_tool_memory_for_messages(s, &msgs);
-    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+    prepare_chat_prompt(s, r, &msgs, tool_schemas);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         free(tool_schemas);
