@@ -1,6 +1,7 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include <inttypes.h>
+#include "golden_distribution.h"
 #include "../ds4_server.c"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
@@ -5905,18 +5906,13 @@ static bool test_topk_contains(const int *top, int k, int id);
 #define TEST_LOCAL_GOLDEN_MAX_TOP 128
 
 typedef struct {
-    int id;
-    float logit;
-} test_local_golden_top;
-
-typedef struct {
     char id[96];
     char mode[16];
     char prompt_path[512];
     int ctx;
     int frontier;
     int ntop;
-    test_local_golden_top top[TEST_LOCAL_GOLDEN_MAX_TOP];
+    golden_logit top[TEST_LOCAL_GOLDEN_MAX_TOP];
 } test_local_golden_case;
 
 static bool test_read_local_golden_case(FILE *fp, test_local_golden_case *tc) {
@@ -6046,23 +6042,26 @@ static void test_local_golden_case_run(ds4_engine *engine,
         const int top64_overlap = test_local_golden_overlap(tc, cand_top, 64);
         const float top20_max_abs =
             test_local_golden_max_abs(tc, cand_logits, 20);
+        const double distribution_distance =
+            golden_distribution_distance(tc->top, tc->ntop, cand_logits, vocab);
 
         fprintf(stderr,
                 "ds4-test: local golden %s top1 ref=%d cand=%d "
                 "top5_overlap=%d/5 top20_overlap=%d/20 top64_overlap=%d/64 "
-                "top20_max_abs=%g\n",
+                "top20_max_abs=%g tv_upper=%.9g\n",
                 tc->id, tc->top[0].id, cand_top[0],
-                top5_overlap, top20_overlap, top64_overlap, top20_max_abs);
+                top5_overlap, top20_overlap, top64_overlap, top20_max_abs,
+                distribution_distance);
 
         /*
-         * This is intentionally tolerant: it is meant to catch substantial
-         * backend drift (wrong tiling, skipped work, bad dispatch), not tiny
-         * floating-point differences from otherwise sane kernel changes.
+         * Preserve the local golden distribution-drift contract: exact greedy
+         * output, bounded logit drift, and at most 0.0001 total variation at
+         * temperature 1, including uncertainty in the unrecorded tail. Rank
+         * overlap is diagnostic: negligible alternatives can change rank
+         * after a numerically correct kernel change without damaging sampling.
          */
         TEST_ASSERT(cand_top[0] == tc->top[0].id);
-        TEST_ASSERT(top5_overlap >= 4);
-        TEST_ASSERT(top20_overlap >= 15);
-        TEST_ASSERT(top64_overlap >= 40);
+        TEST_ASSERT(distribution_distance <= 0.0001);
         TEST_ASSERT(top20_max_abs <= 8.0f);
     } else {
         TEST_ASSERT(false);

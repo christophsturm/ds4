@@ -24,9 +24,35 @@ Files:
   top-logprobs.
 - `flash-CHECKPOINT/official.vec`: compact C-test fixture generated from the
   official JSON.
-- `flash-CHECKPOINT/local-golden.vec`: local top-k/logit fixture captured from
+- `flash-CHECKPOINT/local-golden.vec`: local top-logit fixture captured from
   the matching GGUF. It catches substantial backend drift that can keep the
-  same greedy token while damaging the logits distribution.
+  same greedy token while damaging the probability distribution.
+
+## Local golden distribution-drift contract
+
+The greedy token must match, the saved top-20 logits may differ by at most 8,
+and total variation at temperature 1 must be at most 0.0001. Total variation
+bounds the change in probability of any sampled-token event. The comparison
+uses every candidate logit and adds a conservative bound for the reference's
+unrecorded probability mass: each missing logit is at most the last saved
+logit. An insufficient reference slice fails instead of silently normalizing
+away the unknown tail. Non-finite logits also fail.
+
+Top-5/20/64 overlap remains diagnostic. Rank counts give negligible alternatives
+the same weight as likely tokens, so they do not measure distribution damage.
+Both saved story fixtures put more than 99.99995% probability on their first
+token even under the maximum possible missing-tail mass. The old rank thresholds
+rejected the corrected softplus router from upstream commit `0719a0b` despite
+its independent mathematical checks passing; the fixture values remain intact.
+See [the upstream numerical correction](https://github.com/antirez/ds4/pull/1044)
+and [DeepSeek's reference gate](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py).
+
+`make test-golden-distribution` checks the comparison against analytical
+probabilities, including harmless rank changes, meaningful probability shifts
+with the same greedy token, missing-tail uncertainty, and invalid values.
+It runs in the default native suite without loading a model.
+
+## Collecting and running vectors
 
 Regenerate official vectors:
 
