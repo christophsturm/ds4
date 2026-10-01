@@ -7443,6 +7443,8 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    char *native_param_name;
+    buf native_param_value;
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -7475,6 +7477,9 @@ static void openai_tool_stream_free(openai_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
+    free(ts->native_param_name);
+    ts->native_param_name = NULL;
+    buf_free(&ts->native_param_value);
     ts->ids = NULL;
     ts->ids_cap = 0;
 }
@@ -8079,6 +8084,11 @@ static size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
 static bool openai_tool_emit_args_fragment(int fd, const request *r, const char *id,
                                            openai_tool_stream *ts,
                                            const char *text, size_t len) {
+    if (r->event_callback) {
+        if (ts->state == DSML_TOOL_PARAM_VALUE && !ts->param_is_string)
+            buf_append(&ts->native_param_value, text, len);
+        return true;
+    }
     return sse_chat_tool_call_args_delta_n(fd, r, id, ts->index, text, len);
 }
 
@@ -8088,6 +8098,20 @@ static bool openai_tool_emit_string_value(int fd, const request *r, const char *
     if (len == 0) return true;
     char *raw = xstrndup(text, len);
     ds4_tool_text_unescape(raw, ts->param_end);
+    if (r->event_callback) {
+        const ds4_value value = {
+            .kind = DS4_VALUE_STRING, .key = ts->native_param_name,
+            .key_length = strlen(ts->native_param_name),
+            .text = raw, .text_length = strlen(raw),
+        };
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_TOOL_ARGUMENT_TEXT, .tool_index = ts->index, .value = &value,
+        };
+        buf_append(&ts->native_param_value, raw, value.text_length);
+        bool ok = r->event_callback(r->event_context, &event);
+        free(raw);
+        return ok;
+    }
     buf frag = {0};
     json_escape_fragment_n(&frag, raw, strlen(raw));
     bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
@@ -8099,6 +8123,12 @@ static bool openai_tool_emit_string_value(int fd, const request *r, const char *
 static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *id,
                                           openai_tool_stream *ts,
                                           const char *name, bool is_string) {
+    if (r->event_callback) {
+        free(ts->native_param_name);
+        ts->native_param_name = xstrdup(name);
+        buf_free(&ts->native_param_value);
+        return true;
+    }
     buf frag = {0};
     if (ts->first_param) ts->first_param = false;
     else buf_putc(&frag, ',');
@@ -8222,6 +8252,32 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     }
     if (ts->param_is_string &&
         !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
+    if (r->event_callback) {
+        ds4_value value = {0};
+        bool parsed;
+        if (ts->param_is_string) {
+            value.kind = DS4_VALUE_STRING;
+            value.text = xstrndup(ts->native_param_value.ptr ? ts->native_param_value.ptr : "",
+                                  ts->native_param_value.len);
+            value.text_length = ts->native_param_value.len;
+            parsed = true;
+        } else {
+            const char *cursor = ts->native_param_value.ptr ? ts->native_param_value.ptr : "";
+            parsed = native_value_parse(&cursor, &value, 0);
+            json_ws(&cursor);
+            parsed = parsed && !*cursor;
+        }
+        /* Final parsing owns recovery of malformed model output. Only publish
+         * complete, valid values here; the final object remains authoritative. */
+        value.key = xstrdup(ts->native_param_name);
+        value.key_length = strlen(ts->native_param_name);
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_TOOL_ARGUMENT, .tool_index = ts->index, .value = &value,
+        };
+        bool ok = !parsed || r->event_callback(r->event_context, &event);
+        native_value_free(&value);
+        if (!ok) return false;
+    }
     ts->parse_pos = value_end + strlen(ts->param_end);
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
@@ -18102,6 +18158,7 @@ typedef struct {
     ds4_chat_event_kind kind;
     int count, reasoning_started, reasoning_completed, tool_starts[2], done;
     int typed_argument_objects;
+    buf argument_text;
     int prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens;
     bool invalid_tool_index, stop_after_event;
     int current, total, error_status;
@@ -18118,6 +18175,10 @@ static bool test_capture_native_event(void *context, const ds4_chat_event *event
         buf_append(&capture->reasoning, event->text, event->text_length); break;
     case DS4_CHAT_REASONING_STARTED: capture->reasoning_started++; break;
     case DS4_CHAT_REASONING_COMPLETED: capture->reasoning_completed++; break;
+    case DS4_CHAT_TOOL_ARGUMENT_TEXT:
+        if (event->value && event->value->kind == DS4_VALUE_STRING)
+            buf_append(&capture->argument_text, event->value->text, event->value->text_length);
+        break;
     case DS4_CHAT_TOOL_START:
     case DS4_CHAT_TOOL_ARGUMENTS:
         if (event->tool_index < 0 || event->tool_index >= 2) {
@@ -18203,6 +18264,7 @@ static void test_native_chat_streams_tools_and_completion(void) {
         DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
     const bool prefix_ok = openai_sse_stream_update(-1, NULL, &r, "native-tools", &st,
                                                    prefix, strlen(prefix), false);
+    TEST_ASSERT(capture.argument_text.ptr && !strcmp(capture.argument_text.ptr, "first"));
     const bool full_ok = openai_sse_stream_update(-1, NULL, &r, "native-tools", &st,
                                                  raw, strlen(raw), false);
     char *content = NULL, *reasoning = NULL;
@@ -18232,6 +18294,7 @@ static void test_native_chat_streams_tools_and_completion(void) {
     TEST_ASSERT(capture.done == 1 && capture.kind == DS4_CHAT_DONE);
     free(content); free(reasoning); tool_calls_free(&calls); openai_stream_free(&st);
     buf_free(&capture.text); buf_free(&capture.reasoning); buf_free(&capture.finish);
+    buf_free(&capture.argument_text);
     for (int i = 0; i < 2; i++) {
         buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
     }
@@ -18295,6 +18358,7 @@ static void test_native_stream_model_syntax_and_utf8_boundaries(void) {
             TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr, "{\"command\":\"cat 🐈\"}"));
             TEST_ASSERT(capture.done == 1 && !capture.invalid_tool_index);
             buf_free(&capture.text); buf_free(&capture.reasoning); buf_free(&capture.finish);
+            buf_free(&capture.argument_text);
             for (int i = 0; i < 2; i++) {
                 buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
             }

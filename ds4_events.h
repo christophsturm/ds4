@@ -12,6 +12,10 @@ typedef enum {
     DS4_CHAT_REASONING_STARTED,
     DS4_CHAT_REASONING_COMPLETED,
     DS4_CHAT_TOOL_START,
+    /* String deltas append text to one named argument. Completed argument
+     * values replace it; TOOL_ARGUMENTS is the final authoritative object. */
+    DS4_CHAT_TOOL_ARGUMENT_TEXT,
+    DS4_CHAT_TOOL_ARGUMENT,
     DS4_CHAT_TOOL_ARGUMENTS,
     DS4_CHAT_FINISH,
     DS4_CHAT_USAGE,
