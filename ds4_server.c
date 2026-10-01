@@ -6964,6 +6964,13 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
     snprintf(msg, sizeof(msg),
              "Prompt has %d tokens, but the configured context size is %d tokens",
              n_prompt_tokens, ctx_size);
+    if (r && r->event_callback) {
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_ERROR, .text = msg, .text_length = strlen(msg),
+            .error_status = 400, .current = n_prompt_tokens, .total = ctx_size,
+        };
+        return r->event_callback(r->event_context, &event);
+    }
 
     if (r && r->api == API_ANTHROPIC) {
         buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
@@ -18009,6 +18016,21 @@ static void test_native_chat_streams_tools_and_completion(void) {
     request_free(&r);
 }
 
+static void test_native_context_error_preserves_token_counts(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 103);
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    TEST_ASSERT(http_error_context_length_exceeded(-1, false, &r, 127, 113));
+    TEST_ASSERT(capture.count == 1 && capture.kind == DS4_CHAT_ERROR);
+    TEST_ASSERT(capture.error_status == 400);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr,
+        "Prompt has 127 tokens, but the configured context size is 113 tokens"));
+    buf_free(&capture.text);
+    request_free(&r);
+}
+
 static void test_native_stream_does_not_require_socket_headers(void) {
     request r;
     request_init(&r, REQ_CHAT, 101);
@@ -23391,6 +23413,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_prefill_callback_cancels_generation();
     test_native_prefill_errors_preserve_diagnostics();
     test_native_stream_does_not_require_socket_headers();
+    test_native_context_error_preserves_token_counts();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
