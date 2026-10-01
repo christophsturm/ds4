@@ -7005,8 +7005,16 @@ static bool sse_headers(int fd, bool enable_cors) {
     return ok;
 }
 
+/* Errors use the same diagnostic before any transport encoding. */
 static bool sse_error_event(int fd, const request *r, const char *msg) {
     const char *message = msg && msg[0] ? msg : "internal server error";
+    if (r && r->event_callback) {
+        const ds4_chat_event event = {
+            .kind = DS4_CHAT_ERROR, .text = message,
+            .text_length = strlen(message), .error_status = 500,
+        };
+        return r->event_callback(r->event_context, &event);
+    }
     buf b = {0};
     if (r && r->api == API_ANTHROPIC) {
         buf_puts(&b, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":");
@@ -12869,10 +12877,16 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
 }
 
+/* Native clients receive failures even before streaming would send headers. */
 static void send_prefill_failure_response(server *s, const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
                                           const char *err) {
+    if (j->req.event_callback) {
+        if (!progress || !progress->stream_failed)
+            sse_error_event(j->fd, &j->req, err);
+        return;
+    }
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
@@ -17864,7 +17878,7 @@ typedef struct {
     int count, reasoning_started, reasoning_completed, tool_starts[2], done;
     int prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens;
     bool invalid_tool_index, stop_after_event;
-    int current, total;
+    int current, total, error_status;
 } test_native_event_capture;
 
 static bool test_capture_native_event(void *context, const ds4_chat_event *event) {
@@ -17898,6 +17912,10 @@ static bool test_capture_native_event(void *context, const ds4_chat_event *event
         capture->completion_tokens = event->completion_tokens;
         capture->cache_read_tokens = event->cache_read_tokens;
         capture->cache_write_tokens = event->cache_write_tokens;
+        break;
+    case DS4_CHAT_ERROR:
+        capture->error_status = event->error_status;
+        buf_append(&capture->text, event->text, event->text_length);
         break;
     case DS4_CHAT_DONE: capture->done++; break;
     case DS4_CHAT_PREFILL:
@@ -17988,6 +18006,32 @@ static void test_native_chat_streams_tools_and_completion(void) {
         buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
     }
     request_free(&r);
+}
+
+static void test_native_prefill_errors_preserve_diagnostics(void) {
+    job j = {.fd = -1};
+    request_init(&j.req, REQ_CHAT, 97);
+    test_native_event_capture capture = {0};
+    j.req.event_callback = test_capture_native_event;
+    j.req.event_context = &capture;
+    j.req.stream = true;
+    server s = {0};
+    server_prefill_progress progress = {0};
+    send_prefill_failure_response(&s, &j, &progress, "native-before", "", "first\n\"failure\"");
+    TEST_ASSERT(capture.count == 1);
+    TEST_ASSERT(capture.kind == DS4_CHAT_ERROR && capture.error_status == 500);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "first\n\"failure\""));
+    buf_free(&capture.text);
+    progress.headers_sent = true;
+    send_prefill_failure_response(&s, &j, &progress, "native-after", "", "second\failure");
+    TEST_ASSERT(capture.count == 2);
+    TEST_ASSERT(capture.kind == DS4_CHAT_ERROR && capture.error_status == 500);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "second\failure"));
+    buf_free(&capture.text);
+    progress.stream_failed = true;
+    send_prefill_failure_response(&s, &j, &progress, "native-closed", "", "ignored failure");
+    TEST_ASSERT(capture.count == 2);
+    request_free(&j.req);
 }
 
 static void test_native_prefill_callback_cancels_generation(void) {
@@ -23333,6 +23377,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_chat_content_preserves_bytes();
     test_native_chat_streams_tools_and_completion();
     test_native_prefill_callback_cancels_generation();
+    test_native_prefill_errors_preserve_diagnostics();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
