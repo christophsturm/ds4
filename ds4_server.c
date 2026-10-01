@@ -18118,6 +18118,73 @@ static void test_native_chat_streams_tools_and_completion(void) {
     request_free(&r);
 }
 
+/* Existing model parsers must preserve identical native values at every byte split. */
+static void test_native_stream_model_syntax_and_utf8_boundaries(void) {
+    const struct { server_model_syntax syntax; const char *tool; } cases[] = {
+        {SERVER_MODEL_SYNTAX_DEEPSEEK,
+         DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">\n"
+         DS4_PARAM_START " name=\"command\" string=\"true\">cat 🐈" DS4_PARAM_END "\n"
+         DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END},
+        {SERVER_MODEL_SYNTAX_DEEPSEEK41,
+         DS41_TOOL_CALLS_START "\n" DS41_INVOKE_START " name=\"bash\">\n"
+         DS41_PARAM_START " name=\"command\" string=\"true\">cat 🐈" DS41_PARAM_END "\n"
+         DS41_INVOKE_END "\n" DS41_TOOL_CALLS_END},
+        {SERVER_MODEL_SYNTAX_GLM,
+         "<tool_call>bash<arg_key>command</arg_key><arg_value>cat 🐈</arg_value></tool_call>"},
+        {SERVER_MODEL_SYNTAX_QWEN,
+         "<tool_call><function=bash><parameter=command>cat 🐈</parameter></function></tool_call>"},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        buf raw = {0};
+        buf_puts(&raw, "<think>thought猫</think>answer犬\n\n");
+        buf_puts(&raw, cases[c].tool);
+        for (size_t split = 0; split <= raw.len; split++) {
+            request r;
+            request_init(&r, REQ_CHAT, 109);
+            test_native_event_capture capture = {0};
+            r.event_callback = test_capture_native_event;
+            r.event_context = &capture;
+            r.stream = true;
+            r.stream_include_usage = true;
+            r.think_mode = DS4_THINK_HIGH;
+            r.has_tools = true;
+            r.model_syntax = cases[c].syntax;
+            r.tool_orders = make_bash_order();
+            openai_stream st;
+            openai_stream_start(&r, &st);
+            char *prefix = xstrndup(raw.ptr, split);
+            bool first = openai_sse_stream_update(-1, NULL, &r, "split", &st, prefix, split, false);
+            bool second = openai_sse_stream_update(-1, NULL, &r, "split", &st, raw.ptr, raw.len, true);
+            char *content = NULL, *reasoning = NULL;
+            tool_calls calls = {0};
+            const char *finish = "tool_calls";
+            char err[160] = {0};
+            bool recovered = false;
+            bool parsed = parse_generated_message_for_response_for_syntax(r.model_syntax,
+                raw.ptr, true, true, true, &finish, err, sizeof(err), &content, &reasoning,
+                &calls, &recovered, &r.tool_orders);
+            apply_openai_stream_tool_ids(&calls, &st);
+            bool completed = openai_sse_finish_live(-1, NULL, &r, "split", &st,
+                raw.ptr, raw.len, &calls, finish, 23, 31);
+            TEST_ASSERT(first && second && parsed && completed);
+            TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "answer犬"));
+            TEST_ASSERT(capture.reasoning.ptr && !strcmp(capture.reasoning.ptr, "thought猫"));
+            TEST_ASSERT(capture.reasoning_started == 1 && capture.reasoning_completed == 1);
+            TEST_ASSERT(capture.tool_starts[0] == 1 && capture.tool_starts[1] == 0);
+            TEST_ASSERT(capture.names[0].ptr && !strcmp(capture.names[0].ptr, "bash"));
+            TEST_ASSERT(capture.arguments[0].ptr && !strcmp(capture.arguments[0].ptr, "{\"command\":\"cat 🐈\"}"));
+            TEST_ASSERT(capture.done == 1 && !capture.invalid_tool_index);
+            buf_free(&capture.text); buf_free(&capture.reasoning); buf_free(&capture.finish);
+            for (int i = 0; i < 2; i++) {
+                buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
+            }
+            free(prefix); free(content); free(reasoning); tool_calls_free(&calls);
+            openai_stream_free(&st); request_free(&r);
+        }
+        buf_free(&raw);
+    }
+}
+
 static void test_native_chat_copies_images_in_message_order(void) {
     ds4_chat *chat = ds4_chat_create();
     int user = ds4_chat_add_message(chat, "user", "before ", NULL, NULL);
@@ -23575,6 +23642,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_context_error_preserves_token_counts();
     test_native_chat_renders_history_and_tools();
     test_native_chat_copies_images_in_message_order();
+    test_native_stream_model_syntax_and_utf8_boundaries();
     test_openai_thinking_boundaries_preserve_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
