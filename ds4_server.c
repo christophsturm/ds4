@@ -3706,8 +3706,16 @@ static bool native_value_json(buf *out, const ds4_value *value, unsigned depth) 
             uint64_t bits;
             memcpy(&bits, &value->number, sizeof(bits));
             if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000)) return false;
+            /* Avoid binary rounding noise in ordinary decimals while retaining
+             * all significant digits needed to recover the exact double. */
+            char text[32];
+            for (int digits = 15; digits <= 17; digits++) {
+                snprintf(text, sizeof(text), "%.*g", digits, value->number);
+                double recovered = strtod(text, NULL);
+                if (!memcmp(&recovered, &value->number, sizeof(recovered))) break;
+            }
+            buf_puts(out, text);
         }
-        buf_printf(out, "%.17g", value->number);
         return true;
     case DS4_VALUE_STRING:
         if (!value->text && value->text_length) return false;
@@ -18415,6 +18423,31 @@ static void test_native_typed_tool_values_round_trip(void) {
     ds4_chat_free(chat);
 }
 
+/* Replayed tool numbers must stay readable without changing their double value. */
+static void test_native_chat_renders_compact_numbers(void) {
+    const struct { double number; const char *text; } cases[] = {
+        {0.7, "0.7"}, {0.1, "0.1"}, {-0.0, "-0"},
+        {1.234567890123456, "1.234567890123456"},
+        {1.2345678901234567, "1.2345678901234567"},
+        {1000000.0, "1000000"}, {1e-20, "1e-20"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ds4_chat *chat = ds4_chat_create();
+        int message = ds4_chat_add_message(chat, "assistant", "", NULL, NULL);
+        ds4_value field = {.kind = DS4_VALUE_NUMBER, .number = cases[i].number,
+                           .key = "amount", .key_length = 6};
+        ds4_value arguments = {.kind = DS4_VALUE_OBJECT, .children = &field, .count = 1};
+        bool accepted = ds4_chat_add_tool_call(chat, message, "decimal-call", "measure", &arguments);
+        char *prompt = ds4_chat_render(chat, NULL, DS4_THINK_NONE, true);
+        buf expected = {0};
+        buf_printf(&expected, "name=\"amount\" string=\"false\">%s" DS4_PARAM_END, cases[i].text);
+        TEST_ASSERT(accepted && prompt && strstr(prompt, expected.ptr));
+        buf_free(&expected);
+        free(prompt);
+        ds4_chat_free(chat);
+    }
+}
+
 static void test_native_chat_copies_images_in_message_order(void) {
     ds4_chat *chat = ds4_chat_create();
     int user = ds4_chat_add_message(chat, "user", "before ", NULL, NULL);
@@ -23900,6 +23933,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_stream_does_not_require_socket_headers();
     test_native_context_error_preserves_token_counts();
     test_native_chat_renders_history_and_tools();
+    test_native_chat_renders_compact_numbers();
     test_native_chat_copies_images_in_message_order();
     test_native_stream_model_syntax_and_utf8_boundaries();
     test_native_typed_tool_values_round_trip();
