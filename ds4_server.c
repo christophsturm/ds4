@@ -3706,8 +3706,16 @@ static bool native_value_json(buf *out, const ds4_value *value, unsigned depth) 
             uint64_t bits;
             memcpy(&bits, &value->number, sizeof(bits));
             if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000)) return false;
+            /* Avoid binary rounding noise in ordinary decimals while retaining
+             * all significant digits needed to recover the exact double. */
+            char text[32];
+            for (int digits = 15; digits <= 17; digits++) {
+                snprintf(text, sizeof(text), "%.*g", digits, value->number);
+                double recovered = strtod(text, NULL);
+                if (!memcmp(&recovered, &value->number, sizeof(recovered))) break;
+            }
+            buf_puts(out, text);
         }
-        buf_printf(out, "%.17g", value->number);
         return true;
     case DS4_VALUE_STRING:
         if (!value->text && value->text_length) return false;
@@ -3830,7 +3838,10 @@ bad_child:
     if (!json_number(p, &value->number)) return false;
     uint64_t bits;
     memcpy(&bits, &value->number, sizeof(bits));
-    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+    /* A volatile integer read prevents -ffast-math from assuming strtod's
+     * result is finite and deleting this validation of untrusted input. */
+    volatile uint64_t exponent = bits & UINT64_C(0x7ff0000000000000);
+    return exponent != UINT64_C(0x7ff0000000000000);
 }
 
 bool ds4_chat_add_image(ds4_chat *chat, int message, const char *media_type,
@@ -8527,10 +8538,18 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
                 bool parsed = native_value_parse(&cursor, &arguments, 0);
                 json_ws(&cursor);
                 parsed = parsed && !*cursor && arguments.kind == DS4_VALUE_OBJECT;
+                if (!parsed) {
+                    native_value_free(&arguments);
+                    char diagnostic[96];
+                    snprintf(diagnostic, sizeof(diagnostic),
+                        "invalid tool call at index %d: invalid arguments", i);
+                    sse_error_event(fd, r, diagnostic);
+                    return false;
+                }
                 const ds4_chat_event event = {
                     .kind = DS4_CHAT_TOOL_ARGUMENTS, .tool_index = i, .value = &arguments,
                 };
-                const bool delivered = parsed && r->event_callback(r->event_context, &event);
+                const bool delivered = r->event_callback(r->event_context, &event);
                 native_value_free(&arguments);
                 if (!delivered) return false;
             }
@@ -18415,6 +18434,62 @@ static void test_native_typed_tool_values_round_trip(void) {
     ds4_chat_free(chat);
 }
 
+/* Replayed tool numbers must stay readable without changing their double value. */
+static void test_native_chat_renders_compact_numbers(void) {
+    const struct { double number; const char *text; } cases[] = {
+        {0.7, "0.7"}, {0.1, "0.1"}, {-0.0, "-0"},
+        {1.234567890123456, "1.234567890123456"},
+        {1.2345678901234567, "1.2345678901234567"},
+        {1000000.0, "1000000"}, {1e-20, "1e-20"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ds4_chat *chat = ds4_chat_create();
+        int message = ds4_chat_add_message(chat, "assistant", "", NULL, NULL);
+        ds4_value field = {.kind = DS4_VALUE_NUMBER, .number = cases[i].number,
+                           .key = "amount", .key_length = 6};
+        ds4_value arguments = {.kind = DS4_VALUE_OBJECT, .children = &field, .count = 1};
+        bool accepted = ds4_chat_add_tool_call(chat, message, "decimal-call", "measure", &arguments);
+        char *prompt = ds4_chat_render(chat, NULL, DS4_THINK_NONE, true);
+        buf expected = {0};
+        buf_printf(&expected, "name=\"amount\" string=\"false\">%s" DS4_PARAM_END, cases[i].text);
+        TEST_ASSERT(accepted && prompt && strstr(prompt, expected.ptr));
+        buf_free(&expected);
+        free(prompt);
+        ds4_chat_free(chat);
+    }
+}
+
+/* A model's invalid number must report the failed call instead of disappearing. */
+static void test_native_chat_reports_invalid_tool_arguments(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 139);
+    r.think_mode = DS4_THINK_NONE;
+    r.stream_include_usage = true;
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    openai_stream stream;
+    openai_stream_start(&r, &stream);
+    tool_calls calls = {0};
+    tool_calls_push(&calls, (tool_call){.id = xstrdup("valid-call"),
+        .name = xstrdup("first"), .arguments = xstrdup("{\"valid\":37}")});
+    tool_calls_push(&calls, (tool_call){.id = xstrdup("invalid-call"),
+        .name = xstrdup("second"), .arguments = xstrdup("{\"invalid\":NaN}")});
+    bool finished = openai_sse_finish_live(-1, NULL, &r, "invalid-native", &stream,
+        "", 0, &calls, "tool_calls", 41, 13);
+    TEST_ASSERT(!finished);
+    TEST_ASSERT(capture.kind == DS4_CHAT_ERROR && capture.error_status == 500);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "invalid tool call at index 1: invalid arguments"));
+    TEST_ASSERT(capture.typed_argument_objects == 1 && capture.done == 0 && capture.finish.len == 0);
+    for (int i = 0; i < 2; i++) {
+        buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
+    }
+    buf_free(&capture.text);
+    tool_calls_free(&calls);
+    openai_stream_free(&stream);
+    request_free(&r);
+}
+
 static void test_native_chat_copies_images_in_message_order(void) {
     ds4_chat *chat = ds4_chat_create();
     int user = ds4_chat_add_message(chat, "user", "before ", NULL, NULL);
@@ -23900,6 +23975,8 @@ static void ds4_server_unit_tests_run(void) {
     test_native_stream_does_not_require_socket_headers();
     test_native_context_error_preserves_token_counts();
     test_native_chat_renders_history_and_tools();
+    test_native_chat_renders_compact_numbers();
+    test_native_chat_reports_invalid_tool_arguments();
     test_native_chat_copies_images_in_message_order();
     test_native_stream_model_syntax_and_utf8_boundaries();
     test_native_typed_tool_values_round_trip();
