@@ -3838,7 +3838,10 @@ bad_child:
     if (!json_number(p, &value->number)) return false;
     uint64_t bits;
     memcpy(&bits, &value->number, sizeof(bits));
-    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+    /* A volatile integer read prevents -ffast-math from assuming strtod's
+     * result is finite and deleting this validation of untrusted input. */
+    volatile uint64_t exponent = bits & UINT64_C(0x7ff0000000000000);
+    return exponent != UINT64_C(0x7ff0000000000000);
 }
 
 bool ds4_chat_add_image(ds4_chat *chat, int message, const char *media_type,
@@ -8535,10 +8538,18 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
                 bool parsed = native_value_parse(&cursor, &arguments, 0);
                 json_ws(&cursor);
                 parsed = parsed && !*cursor && arguments.kind == DS4_VALUE_OBJECT;
+                if (!parsed) {
+                    native_value_free(&arguments);
+                    char diagnostic[96];
+                    snprintf(diagnostic, sizeof(diagnostic),
+                        "invalid tool call at index %d: invalid arguments", i);
+                    sse_error_event(fd, r, diagnostic);
+                    return false;
+                }
                 const ds4_chat_event event = {
                     .kind = DS4_CHAT_TOOL_ARGUMENTS, .tool_index = i, .value = &arguments,
                 };
-                const bool delivered = parsed && r->event_callback(r->event_context, &event);
+                const bool delivered = r->event_callback(r->event_context, &event);
                 native_value_free(&arguments);
                 if (!delivered) return false;
             }
@@ -18448,6 +18459,37 @@ static void test_native_chat_renders_compact_numbers(void) {
     }
 }
 
+/* A model's invalid number must report the failed call instead of disappearing. */
+static void test_native_chat_reports_invalid_tool_arguments(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 139);
+    r.think_mode = DS4_THINK_NONE;
+    r.stream_include_usage = true;
+    test_native_event_capture capture = {0};
+    r.event_callback = test_capture_native_event;
+    r.event_context = &capture;
+    openai_stream stream;
+    openai_stream_start(&r, &stream);
+    tool_calls calls = {0};
+    tool_calls_push(&calls, (tool_call){.id = xstrdup("valid-call"),
+        .name = xstrdup("first"), .arguments = xstrdup("{\"valid\":37}")});
+    tool_calls_push(&calls, (tool_call){.id = xstrdup("invalid-call"),
+        .name = xstrdup("second"), .arguments = xstrdup("{\"invalid\":NaN}")});
+    bool finished = openai_sse_finish_live(-1, NULL, &r, "invalid-native", &stream,
+        "", 0, &calls, "tool_calls", 41, 13);
+    TEST_ASSERT(!finished);
+    TEST_ASSERT(capture.kind == DS4_CHAT_ERROR && capture.error_status == 500);
+    TEST_ASSERT(capture.text.ptr && !strcmp(capture.text.ptr, "invalid tool call at index 1: invalid arguments"));
+    TEST_ASSERT(capture.typed_argument_objects == 1 && capture.done == 0 && capture.finish.len == 0);
+    for (int i = 0; i < 2; i++) {
+        buf_free(&capture.arguments[i]); buf_free(&capture.names[i]); buf_free(&capture.ids[i]);
+    }
+    buf_free(&capture.text);
+    tool_calls_free(&calls);
+    openai_stream_free(&stream);
+    request_free(&r);
+}
+
 static void test_native_chat_copies_images_in_message_order(void) {
     ds4_chat *chat = ds4_chat_create();
     int user = ds4_chat_add_message(chat, "user", "before ", NULL, NULL);
@@ -23934,6 +23976,7 @@ static void ds4_server_unit_tests_run(void) {
     test_native_context_error_preserves_token_counts();
     test_native_chat_renders_history_and_tools();
     test_native_chat_renders_compact_numbers();
+    test_native_chat_reports_invalid_tool_arguments();
     test_native_chat_copies_images_in_message_order();
     test_native_stream_model_syntax_and_utf8_boundaries();
     test_native_typed_tool_values_round_trip();
