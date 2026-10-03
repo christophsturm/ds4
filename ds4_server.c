@@ -8376,8 +8376,6 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                                      bool final) {
     if (!st->active || !raw) return true;
 
-    /* A completed block can be followed by another block in the same chunk. */
-next_block:
     if (st->mode == OPENAI_STREAM_THINKING) {
         if (!st->thinking_started) {
             if (!sse_chat_delta_n(fd, r, id, "reasoning_block", "started", 7)) return false;
@@ -8471,18 +8469,6 @@ next_block:
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
 
-        const char *open = strstr(raw + st->emit_pos, "<think>");
-        if (open && (!tool || open < tool)) {
-            if ((size_t)(open - raw) < limit) limit = (size_t)(open - raw);
-        } else {
-            open = NULL;
-            if (!final) {
-                for (size_t n = 1; n < strlen("<think>") && n <= raw_len - st->emit_pos; n++) {
-                    if (!strncmp(raw + raw_len - n, "<think>", n) && raw_len - n < limit)
-                        limit = raw_len - n;
-                }
-            }
-        }
         if (limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "content",
                                   raw + st->emit_pos,
@@ -8491,13 +8477,6 @@ next_block:
             st->emit_pos = limit;
         }
 
-        if (open) {
-            st->emit_pos = (size_t)(open - raw) + strlen("<think>");
-            st->checked_think_prefix = true;
-            st->guard_second_reasoning = false;
-            st->mode = OPENAI_STREAM_THINKING;
-            goto next_block;
-        }
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
             if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
@@ -18114,17 +18093,19 @@ static void test_responses_usage_reports_cache_details(void) {
     request_free(&r);
 }
 
-/* Boundaries are observable independently of content, and text bytes are never
- * inferred from the requested thinking setting. Exercise every byte split. */
+/* Observe upstream thinking boundaries without treating literal tags in an
+ * answer as new reasoning blocks. Exercise every byte split. */
 static void test_openai_thinking_boundaries_preserve_text(void) {
     struct { const char *raw, *reasoning, *content; bool prefilled; int opened, closed; } cases[] = {
+        {"Explain `<think>literal</think>` in code.", "", "Explain `<think>literal</think>` in code.", false, 0, 0},
         {"  plain\n\t", "", "  plain\n\t", false, 0, 0},
-        {"<think></think>\n\n  answer", "", "\n\n  answer", false, 1, 1},
-        {"<think> \t\n</think>\tfinal\n", " \t\n", "\tfinal\n", false, 1, 1},
+        {"<think></think>\n\n  answer", "", "\n\n  answer", true, 1, 1},
+        {"<think> \t\n</think>\tfinal\n", " \t\n", "\tfinal\n", true, 1, 1},
         {"\ninside</think>  outside", "\ninside", "  outside", true, 1, 1},
         {"</think>", "", "", true, 1, 1},
-        {"<think></think><think>second</think>end", "second", "end", false, 2, 2},
-        {"<think>\nunfinished", "\nunfinished", "", false, 1, 0},
+        {"<think></think><think>literal</think>end", "", "<think>literal</think>end", true, 1, 1},
+        {"<think>\nunfinished", "\nunfinished", "", true, 1, 0},
+        {"<think>literal</think>", "", "<think>literal</think>", false, 0, 0},
     };
     for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
         for (size_t split = 0; split <= strlen(cases[c].raw); split++) {
