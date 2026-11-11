@@ -261,6 +261,11 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
+/* Bytes the engine plans to hold for a context of ctx_size tokens: KV cache,
+ * buffers, resident model, expert cache and reserves.  It is the total of the
+ * startup "ds4: memory: ... planned" line.  Returns 0 without an engine or
+ * for a non-positive context size. */
+uint64_t ds4_engine_planned_memory_bytes(ds4_engine *e, int ctx_size);
 bool ds4_engine_has_vision(ds4_engine *e);
 int ds4_engine_vision_encode_file(ds4_engine *e,
                                   const char *path,

@@ -44682,11 +44682,21 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
     return total;
 }
 
-static void ds4_engine_print_startup_memory(
+/* What the engine plans to hold for one context size.  The startup memory line
+ * prints these parts and ds4_engine_planned_memory_bytes returns their total. */
+typedef struct {
+    ds4_context_memory mem;
+    uint64_t kv_bytes;
+    uint64_t resident_model_bytes;
+    uint64_t dynamic_expert_cache_bytes;
+    uint64_t expert_reserved_bytes;
+    uint64_t ds41_drafter_bytes;
+    uint64_t total;
+} ds4_engine_memory_plan;
+
+static ds4_engine_memory_plan ds4_engine_memory_plan_for(
         const ds4_engine *e,
         int               ctx_size) {
-    if (!e || ctx_size <= 0) return;
-
     ds4_context_memory mem;
 #ifndef DS4_NO_GPU
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
@@ -44752,6 +44762,31 @@ static void ds4_engine_print_startup_memory(
     const uint64_t ds41_drafter_bytes = e->dspark && e->dspark_weights.v41 ?
         ds4_add_sat_u64(e->mtp_model.size, UINT64_C(64) << 20) : 0;
     total = ds4_add_sat_u64(total, ds41_drafter_bytes);
+
+    return (ds4_engine_memory_plan){
+        .mem = mem,
+        .kv_bytes = kv_bytes,
+        .resident_model_bytes = resident_model_bytes,
+        .dynamic_expert_cache_bytes = dynamic_expert_cache_bytes,
+        .expert_reserved_bytes = expert_reserved_bytes,
+        .ds41_drafter_bytes = ds41_drafter_bytes,
+        .total = total,
+    };
+}
+
+static void ds4_engine_print_startup_memory(
+        const ds4_engine *e,
+        int               ctx_size) {
+    if (!e || ctx_size <= 0) return;
+
+    const ds4_engine_memory_plan plan = ds4_engine_memory_plan_for(e, ctx_size);
+    const ds4_context_memory mem = plan.mem;
+    const uint64_t kv_bytes = plan.kv_bytes;
+    const uint64_t resident_model_bytes = plan.resident_model_bytes;
+    const uint64_t dynamic_expert_cache_bytes = plan.dynamic_expert_cache_bytes;
+    const uint64_t expert_reserved_bytes = plan.expert_reserved_bytes;
+    const uint64_t ds41_drafter_bytes = plan.ds41_drafter_bytes;
+    const uint64_t total = plan.total;
 
     const bool color = ds4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
@@ -75350,6 +75385,11 @@ int ds4_engine_embd_dim(ds4_engine *e) {
 
 uint64_t ds4_engine_model_bytes(ds4_engine *e) {
     return e->model.size;
+}
+
+uint64_t ds4_engine_planned_memory_bytes(ds4_engine *e, int ctx_size) {
+    if (!e || ctx_size <= 0) return 0;
+    return ds4_engine_memory_plan_for(e, ctx_size).total;
 }
 
 bool ds4_engine_has_vision(ds4_engine *e) {

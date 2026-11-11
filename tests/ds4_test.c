@@ -7308,6 +7308,41 @@ static void test_dspark_verify_depth(void) {
     ds4_engine_close(engine);
     test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
 }
+
+/* The planned total is the context estimate plus the model-side bytes, and the
+ * model side does not depend on the context size.  A resident model without a
+ * drafter plans its tensor data, which is the file minus a small header. */
+static void test_engine_planned_memory(void) {
+    ds4_engine *engine = test_get_engine(false);
+    const bool streaming = test_env_bool("DS4_TEST_SSD_STREAMING");
+    const char *mtp = getenv("DS4_TEST_MTP");
+    const int ctx_sizes[2] = {4096, 65536};
+    uint64_t model_side[2] = {0, 0};
+
+    for (int i = 0; i < 2; i++) {
+        const ds4_context_memory mem =
+            ds4_context_memory_estimate_with_prefill_mode(
+                test_model_backend(),
+                ctx_sizes[i],
+                ds4_engine_prefill_chunk(engine),
+                streaming);
+        const uint64_t context_bytes =
+            mem.raw_bytes + mem.compressed_bytes + mem.scratch_bytes;
+        const uint64_t planned =
+            ds4_engine_planned_memory_bytes(engine, ctx_sizes[i]);
+        TEST_ASSERT(planned > context_bytes);
+        model_side[i] = planned > context_bytes ? planned - context_bytes : 0;
+    }
+    TEST_ASSERT(model_side[0] == model_side[1]);
+    if (!streaming && !(mtp && mtp[0])) {
+        const uint64_t model_bytes = ds4_engine_model_bytes(engine);
+        TEST_ASSERT(model_side[0] <= model_bytes);
+        TEST_ASSERT(model_side[0] > model_bytes / 2);
+    }
+    TEST_ASSERT(ds4_engine_planned_memory_bytes(engine, 0) == 0);
+    TEST_ASSERT(ds4_engine_planned_memory_bytes(NULL, 4096) == 0);
+}
+
 #endif
 
 static void test_server_unit_group(void) {
@@ -7343,6 +7378,7 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
+    {"--planned-memory", "planned-memory", "engine planned memory total is the context estimate plus context-independent model bytes", test_engine_planned_memory},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
